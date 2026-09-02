@@ -93,6 +93,7 @@ def _read_agent_revision(
 _AGENT_SOURCE_DIR: Path | None = None
 _AGENT_MODULE_PATH: Path | None = None
 _AGENT_REVISION: str | None = None
+_AGENT_MODULE_MTIME_NS: int | None = None
 _AIAgent = None
 _RUNTIME_LOCK = threading.Lock()
 
@@ -117,6 +118,7 @@ def _loaded_agent_source_identity() -> tuple[Path, Path] | None:
 def _capture_loaded_agent_revision() -> None:
     """Bind the guard to the checkout that supplied the loaded Agent module."""
     global _AGENT_SOURCE_DIR, _AGENT_MODULE_PATH, _AGENT_REVISION
+    global _AGENT_MODULE_MTIME_NS
 
     if _AGENT_REVISION is not None:
         ensure_agent_runtime_current()
@@ -127,20 +129,41 @@ def _capture_loaded_agent_revision() -> None:
         return
     source_dir, module_path = identity
     current_revision = _read_agent_revision(source_dir, module_path=module_path)
+    try:
+        current_module_mtime_ns = module_path.stat().st_mtime_ns
+    except OSError:
+        current_module_mtime_ns = None
     _AGENT_SOURCE_DIR = source_dir
     _AGENT_MODULE_PATH = module_path
     _AGENT_REVISION = current_revision
+    _AGENT_MODULE_MTIME_NS = current_module_mtime_ns
 
 
 def ensure_agent_runtime_current() -> None:
     """Reject a known Git checkout change instead of mixing Python modules."""
     if _AGENT_REVISION is None:
         return
-    if (
-        _read_agent_revision(_AGENT_SOURCE_DIR, module_path=_AGENT_MODULE_PATH)
-        != _AGENT_REVISION
-    ):
-        raise AgentRuntimeChangedError(_RESTART_MESSAGE)
+    fresh_revision = _read_agent_revision(
+        _AGENT_SOURCE_DIR, module_path=_AGENT_MODULE_PATH
+    )
+    if fresh_revision == _AGENT_REVISION:
+        return
+
+    # When .git is removed from a running Git-managed worktree, revision discovery
+    # returns None without changing the loaded module. Check module mtime to avoid
+    # false-positive runtime mismatch errors when the module source is unchanged.
+    if fresh_revision is None:
+        try:
+            fresh_module_mtime_ns = _AGENT_MODULE_PATH.stat().st_mtime_ns
+        except OSError:
+            fresh_module_mtime_ns = None
+        if (
+            _AGENT_MODULE_MTIME_NS is not None
+            and fresh_module_mtime_ns == _AGENT_MODULE_MTIME_NS
+        ):
+            return
+
+    raise AgentRuntimeChangedError(_RESTART_MESSAGE)
 
 
 def require_ai_agent_class():
