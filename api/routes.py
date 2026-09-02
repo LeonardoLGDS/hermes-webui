@@ -12811,6 +12811,37 @@ _INDEX_SHELL_CACHE: dict = {}
 _INDEX_SHELL_CACHE_LOCK = threading.Lock()
 
 
+def _assets_cache_bust_token(static_root: Path) -> str:
+    """Return a cache token covering the WebUI's served static shell.
+
+    The token changes whenever any bundle under static_root changes (name,
+    size, or mtime), even when WEBUI_VERSION stays constant (non-git
+    installs). Cache name must change on bundle edits or the service-worker
+    cache serves stale bundles indefinitely; hard refresh does not bypass
+    service-worker caches.
+    """
+    from urllib.parse import quote
+    from api.updates import WEBUI_VERSION
+
+    try:
+        fingerprint = hashlib.sha256()
+        paths = (
+            sorted(static_root.glob("*.js"))
+            + sorted(static_root.glob("*.css"))
+            + [static_root / "index.html"]
+        )
+        for path in paths:
+            if not path.exists():
+                continue
+            stat = path.stat()
+            fingerprint.update(
+                f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
+            )
+        return quote(f"{WEBUI_VERSION}+a{fingerprint.hexdigest()[:10]}", safe="")
+    except Exception:
+        return quote(WEBUI_VERSION, safe="")
+
+
 def _render_index_shell_base() -> str:
     """Return static/index.html with the process-constant tokens substituted.
 
@@ -12818,8 +12849,6 @@ def _render_index_shell_base() -> str:
     extension-tag injection are intentionally NOT applied here — they vary per
     request and are applied by the caller against this base string.
     """
-    from api.updates import WEBUI_VERSION
-
     index_path = api_config.get_index_html_path()
     st = index_path.stat()
     sig = (index_path, st.st_size, st.st_mtime_ns)
@@ -12827,9 +12856,7 @@ def _render_index_shell_base() -> str:
         cached = _INDEX_SHELL_CACHE.get("base")
         if cached and cached[0] == sig:
             return cached[1]
-    from urllib.parse import quote
-
-    version_token = quote(WEBUI_VERSION, safe="")
+    version_token = _assets_cache_bust_token(api_config.get_static_root())
     base = (
         index_path.read_text(encoding="utf-8")
         .replace("__WEBUI_VERSION__", version_token)
@@ -13640,9 +13667,8 @@ def handle_get(handler, parsed) -> bool:
         if sw_path.exists():
             # Inject the current git-derived version as the cache name so the
             # service worker cache busts automatically on every new deploy.
-            from urllib.parse import quote
-            from api.updates import WEBUI_VERSION
-            version_token = quote(WEBUI_VERSION, safe="")
+            # The token also changes for bundle edits via _assets_cache_bust_token, not only for a new WEBUI_VERSION deploy.
+            version_token = _assets_cache_bust_token(static_root)
             text = sw_path.read_text(encoding="utf-8").replace(
                 "__WEBUI_VERSION__", version_token
             )
