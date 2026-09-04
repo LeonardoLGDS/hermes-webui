@@ -29,6 +29,7 @@ import uuid
 import http.client
 import socket as _socket
 from collections import defaultdict, deque, OrderedDict
+from contextvars import ContextVar
 from pathlib import Path
 from contextlib import closing
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit
@@ -63,6 +64,9 @@ from api.gateway_restart import restart_active_profile_gateway
 from api.shares import create_or_refresh_share, load_share, revoke_share
 
 logger = logging.getLogger(__name__)
+_SESSION_LIST_RESPONSE_DEGRADED = ContextVar(
+    "webui_session_list_response_degraded", default=False
+)
 
 
 def _publish_session_list_changed(
@@ -2470,7 +2474,11 @@ def _build_session_list_cache_payload(
     diag_stage("sort_sessions")
     merged = webui_sessions + deduped_cli
     merged.sort(
-        key=lambda s: s.get("last_message_at") or s.get("updated_at", 0) or 0,
+        # WHY: 2026-09-04 19:11 sidebar 500s (2 failures amid 246 successful
+        # polls) proved a single persisted row can carry a nonnumeric timestamp.
+        # Reuse the cache/runtime normalizer so that edge sorts last instead of
+        # aborting every row in the 496e4fc bounded-list build.
+        key=_session_list_row_timestamp,
         reverse=True,
     )
     # ── Profile scoping (#1611) ────────────────────────────────────────
@@ -2628,9 +2636,165 @@ def _build_session_list_cache_payload(
     }
 
 
+def _degraded_session_list_payload_from_index(
+    *,
+    active_profile: str | None,
+    all_profiles: bool,
+    show_cli_sessions: bool,
+    show_previous_messaging_sessions: bool,
+    show_cron_sessions: bool,
+    show_claude_code_sessions: bool,
+    include_archived: bool,
+    exclude_hidden: bool,
+    show_webhook_sessions: bool,
+    show_kanban_sessions: bool,
+    sidebar_source: str | None,
+    archived_limit: int | None,
+    archived_offset: int,
+) -> dict:
+    """Build a lightweight /api/sessions payload from ``_index.json`` only.
+
+    This is deliberately not another ``all_sessions()`` build: the bounded
+    background worker remains the sole owner of heavy reconciliation.  It is a
+    last-resort read for cold-cache builder failures, so every malformed index
+    entry is skipped independently and the route still returns a valid sidebar
+    envelope.  Memory-budget refusals intentionally escape to the existing HTTP
+    pressure boundary rather than being mistaken for an ordinary builder error.
+    """
+    empty = {
+        "sessions": [],
+        "sidebar_reference_sessions": [],
+        "cli_count": 0,
+        "archived_count": 0,
+        "archived_webui_count": 0,
+        "archived_cli_count": 0,
+        "webui_session_count": 0,
+        "cli_session_count": 0,
+        "include_archived": include_archived,
+        "archived_limit": archived_limit,
+        "archived_offset": archived_offset,
+        "all_profiles": all_profiles,
+        "active_profile": active_profile,
+        "other_profile_count": 0,
+        "settings": {
+            "show_cli_sessions": show_cli_sessions,
+            "show_previous_messaging_sessions": show_previous_messaging_sessions,
+            "show_cron_sessions": show_cron_sessions,
+            "show_claude_code_sessions": show_claude_code_sessions if show_cli_sessions else False,
+            "show_webhook_sessions": show_webhook_sessions,
+            "show_kanban_sessions": show_kanban_sessions,
+        },
+        "degraded": True,
+        "degraded_reason": "metadata_refresh_pending",
+    }
+    try:
+        from api.wsbound import READ_BUDGET, ReadBudget, read_source_text
+
+        token = None
+        if READ_BUDGET.get() is None:
+            token = READ_BUDGET.set(ReadBudget(8 * 1024 * 1024))
+        try:
+            index_text = read_source_text(Path(SESSION_DIR) / "_index.json")
+        finally:
+            if token is not None:
+                READ_BUDGET.reset(token)
+        index_payload = json.loads(index_text)
+        if not isinstance(index_payload, list):
+            return empty
+
+        rows: list[dict] = []
+        seen_ids: set[str] = set()
+        for entry in index_payload:
+            try:
+                if not isinstance(entry, dict):
+                    continue
+                row = dict(entry)
+                sid = str(row.get("session_id") or "").strip()
+                if not sid or sid in seen_ids:
+                    continue
+                if not all_profiles and not _profiles_match(row.get("profile"), active_profile):
+                    continue
+                is_cli = _is_cli_session_for_settings(row)
+                if is_cli and not show_cli_sessions:
+                    continue
+                if sidebar_source == "webui" and is_cli:
+                    continue
+                if sidebar_source == "cli" and not is_cli:
+                    continue
+                if exclude_hidden and row.get("default_hidden"):
+                    continue
+                if not row.get("archived"):
+                    has_visibility_signal = (
+                        _numeric_count(row.get("message_count")) > 0
+                        or row.get("is_streaming")
+                        or row.get("active_stream_id")
+                        or row.get("pending_user_message")
+                        or row.get("has_pending_user_message")
+                    )
+                    if not has_visibility_signal:
+                        continue
+                seen_ids.add(sid)
+                rows.append(row)
+            except Exception:
+                logger.warning(
+                    "Skipped malformed session index row during degraded list fallback",
+                    exc_info=True,
+                )
+
+        rows.sort(key=_session_list_row_timestamp, reverse=True)
+        visible_rows = [row for row in rows if not row.get("archived")]
+        archived_rows = [row for row in rows if row.get("archived")]
+        archived_total = len(archived_rows)
+        if include_archived and archived_limit is not None:
+            try:
+                limit = max(0, int(archived_limit))
+            except (TypeError, ValueError):
+                limit = None
+            try:
+                offset = max(0, int(archived_offset or 0))
+            except (TypeError, ValueError):
+                offset = 0
+            if limit is not None:
+                rows = visible_rows + archived_rows[offset:offset + limit]
+        else:
+            rows = visible_rows
+
+        cli_rows = [row for row in rows if _is_cli_session_for_settings(row)]
+        webui_rows = [row for row in rows if not _is_cli_session_for_settings(row)]
+        archived_all = [row for row in rows if row.get("archived")]
+        payload = dict(empty)
+        payload.update({
+            "sessions": rows,
+            "cli_count": sum(1 for row in rows if _is_cli_session_for_settings(row)),
+            "archived_count": archived_total,
+            "archived_webui_count": sum(
+                1 for row in archived_rows if not _is_cli_session_for_settings(row)
+            ),
+            "archived_cli_count": sum(
+                1 for row in archived_rows if _is_cli_session_for_settings(row)
+            ),
+            "webui_session_count": len(webui_rows),
+            "cli_session_count": len(cli_rows),
+        })
+        return payload
+    except Exception:
+        logger.warning("Session-list index fallback unavailable", exc_info=True)
+        return empty
+
+
 def _session_list_payload_to_response(payload: dict) -> dict:
     safe_merged = []
-    runtime_rows = _session_list_cache_overlay_runtime_rows(payload.get("sessions", []) or [])
+    degraded = bool(payload.get("degraded"))
+    source_rows = payload.get("sessions", []) or []
+    try:
+        runtime_rows = _session_list_cache_overlay_runtime_rows(source_rows)
+    except Exception:
+        # A single malformed row must not turn the whole sidebar response into
+        # an unhandled 500.  Runtime overlay is enhancement-only, so fall back
+        # to the bounded rows already present in the payload.
+        logger.warning("Session-list runtime overlay failed; using stored rows", exc_info=True)
+        runtime_rows = [row if isinstance(row, dict) else {} for row in source_rows]
+        degraded = True
     # Read the redaction setting ONCE for the whole response and thread it through
     # every row, instead of letting each row's _redact_text() re-read settings.json
     # from disk (per title). The _sidebar_session_response_item -> _redact_text(_enabled=...)
@@ -2650,28 +2814,64 @@ def _session_list_payload_to_response(payload: dict) -> dict:
     except Exception:
         logger.debug("bulk background status unavailable for session list", exc_info=True)
         active_bg_sessions = set()
+
+    def minimal_row(row: dict) -> dict:
+        try:
+            sid = str(row.get("session_id") or "").strip()
+            profile = row.get("profile")
+            source = str(row.get("source_tag") or row.get("raw_source")
+                         or row.get("session_source") or row.get("source") or "").strip()
+        except Exception:
+            sid, profile, source = "", None, ""
+        try:
+            is_cli = bool(row.get("is_cli_session")) if isinstance(row, dict) else False
+        except Exception:
+            is_cli = False
+        return {
+            "session_id": sid,
+            "title": "Session unavailable",
+            "profile": str(profile) if profile is not None else None,
+            "message_count": _numeric_count(row.get("message_count")) if isinstance(row, dict) else 0,
+            "last_message_at": _session_list_row_timestamp(row) if isinstance(row, dict) else 0.0,
+            "archived": bool(row.get("archived")) if isinstance(row, dict) else False,
+            "is_cli_session": is_cli,
+            "read_only": bool(row.get("read_only")) if isinstance(row, dict) else False,
+            "source_tag": source or None,
+            "_sidebar_response_degraded": True,
+        }
+
     for s in runtime_rows:
-        item = (
-            _sidebar_session_response_item(
-                s,
-                redact_enabled=_redact_enabled,
-                active_bg_sessions=active_bg_sessions,
+        try:
+            item = (
+                _sidebar_session_response_item(
+                    s,
+                    redact_enabled=_redact_enabled,
+                    active_bg_sessions=active_bg_sessions,
+                )
+                if isinstance(s, dict)
+                else {}
             )
-            if isinstance(s, dict)
-            else {}
-        )
+        except Exception:
+            logger.warning("Skipped malformed session-list response row", exc_info=True)
+            item = minimal_row(s if isinstance(s, dict) else {})
+            degraded = True
         safe_merged.append(item)
     safe_reference = []
     for s in payload.get("sidebar_reference_sessions", []) or []:
-        item = (
-            _sidebar_session_response_item(
-                s,
-                redact_enabled=_redact_enabled,
-                active_bg_sessions=active_bg_sessions,
+        try:
+            item = (
+                _sidebar_session_response_item(
+                    s,
+                    redact_enabled=_redact_enabled,
+                    active_bg_sessions=active_bg_sessions,
+                )
+                if isinstance(s, dict)
+                else {}
             )
-            if isinstance(s, dict)
-            else {}
-        )
+        except Exception:
+            logger.warning("Skipped malformed sidebar reference response row", exc_info=True)
+            item = minimal_row(s if isinstance(s, dict) else {})
+            degraded = True
         if item:
             item["_sidebar_reference_only"] = True
         safe_reference.append(item)
@@ -2689,6 +2889,11 @@ def _session_list_payload_to_response(payload: dict) -> dict:
         "server_time": time.time(),
         "server_tz": time.strftime("%z"),
     }
+    if degraded:
+        response["degraded"] = True
+        response["degraded_reason"] = payload.get("degraded_reason") or "response_row_failure"
+        if payload.get("error") is not None:
+            response["error"] = str(payload.get("error"))
     if "webui_session_count" in payload:
         response["webui_session_count"] = int(payload.get("webui_session_count", 0))
     if "cli_session_count" in payload:
@@ -10088,15 +10293,11 @@ def _is_messaging_session_id(sid: str) -> bool:
 
 
 def _session_sort_timestamp(session: dict) -> float:
-    return float(
-        _safe_first(
-            session.get("last_message_at"),
-            session.get("updated_at"),
-            session.get("created_at"),
-            session.get("started_at"),
-            0,
-        ) or 0
-    ) or 0.0
+    for key in ("last_message_at", "updated_at", "created_at", "started_at"):
+        value = _session_list_row_numeric_value(session.get(key))
+        if value > 0:
+            return value
+    return 0.0
 
 
 def _is_cli_session_for_settings(session: dict) -> bool:
@@ -13130,6 +13331,18 @@ def handle_get(handler, parsed) -> bool:
             return send_json_bytes(handler, b"", status=304, extra_headers={"ETag": etag(blob)})
         return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
     flight = None
+
+    def flight_json(payload, status=200, extra_headers=None):
+        # WHY: /api/sessions never claims a session-load flight, but boundary
+        # handlers below are shared with /api/session.  Defining this before the
+        # branch prevents a cold list SnapshotPending from taking an
+        # UnboundLocalError detour through the app-wide 500 handler.
+        if flight is not None:
+            # Followers replay the leader's exact serialized result even for
+            # boundary errors, instead of independently re-entering a load.
+            flight.record(_json_response_body(payload), status)
+        return j(handler, payload, status, extra_headers=extra_headers)
+
     if parsed.path == "/api/session":
         flight, is_flight_leader = claim_session_load(key)
         if flight is None:
@@ -13143,12 +13356,6 @@ def handle_get(handler, parsed) -> bool:
             if not completed:
                 extra_headers["Retry-After"] = "1"
             return send_json_bytes(handler, body, status, extra_headers=extra_headers)
-
-        def flight_json(payload, status=200, extra_headers=None):
-            # WHY: followers replay the leader's exact serialized result even
-            # for boundary errors, instead of independently re-entering a load.
-            flight.record(_json_response_body(payload), status)
-            return j(handler, payload, status, extra_headers=extra_headers)
     try:
         retry = admit_poll((str(get_active_hermes_home()), get_active_profile_name(), parsed.path, sid),
                            getattr(handler, 'headers', {}).get("X-WebUI-Poll"))
@@ -13172,7 +13379,11 @@ def handle_get(handler, parsed) -> bool:
                         flight.record(blob, 200)
                     return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
                 def capture(body, status):
-                    if status == 200 and path_stamp(session_path) == source:
+                    if (
+                        status == 200
+                        and path_stamp(session_path) == source
+                        and not _SESSION_LIST_RESPONSE_DEGRADED.get()
+                    ):
                         RESPONSES.put(key, body, ttl=5)
                     if flight is not None:
                         flight.record(body, status)
@@ -14485,47 +14696,136 @@ def _handle_get_impl(handler, parsed) -> bool:
             # heavy lifting now lives in the cache builder: profile scoping via
             # `_profiles_match(s.get("profile"), active_profile)` still happens
             # before `_keep_latest_messaging_session_per_source(`.
-            payload = _get_bounded_session_list_payload(
-                key=key,
-                builder=lambda: _build_session_list_cache_payload(
+            # The fallback_builder remains intentionally unused on the request
+            # thread.  A cold bounded-builder failure instead uses only the
+            # compact sidebar index: the sidebar gets a valid 200 immediately,
+            # while the one-slot background worker retains exclusive ownership of
+            # the heavy reconciliation/retry.  A stale cached payload is already
+            # returned by _get_bounded_session_list_payload before this point.
+            def degraded_payload():
+                return _degraded_session_list_payload_from_index(
                     active_profile=active_profile,
                     all_profiles=all_profiles,
                     show_cli_sessions=show_cli_sessions,
+                    show_previous_messaging_sessions=show_previous_messaging_sessions,
+                    show_cron_sessions=show_cron_sessions,
                     show_claude_code_sessions=show_claude_code_sessions,
-                    show_previous_messaging_sessions=show_previous_messaging_sessions,
-                    show_cron_sessions=show_cron_sessions,
                     include_archived=include_archived,
                     exclude_hidden=exclude_hidden,
-                    visible_only=True,
                     show_webhook_sessions=show_webhook_sessions,
                     show_kanban_sessions=show_kanban_sessions,
-                    source_filter=agent_session_source_filter,
                     sidebar_source=sidebar_source,
                     archived_limit=archived_limit,
                     archived_offset=archived_offset,
+                )
+
+            builder_error: Exception | None = None
+            try:
+                payload = _get_bounded_session_list_payload(
+                    key=key,
+                    builder=lambda: _build_session_list_cache_payload(
+                        active_profile=active_profile,
+                        all_profiles=all_profiles,
+                        show_cli_sessions=show_cli_sessions,
+                        show_claude_code_sessions=show_claude_code_sessions,
+                        show_previous_messaging_sessions=show_previous_messaging_sessions,
+                        show_cron_sessions=show_cron_sessions,
+                        include_archived=include_archived,
+                        exclude_hidden=exclude_hidden,
+                        visible_only=True,
+                        show_webhook_sessions=show_webhook_sessions,
+                        show_kanban_sessions=show_kanban_sessions,
+                        source_filter=agent_session_source_filter,
+                        sidebar_source=sidebar_source,
+                        archived_limit=archived_limit,
+                        archived_offset=archived_offset,
+                        diag=diag,
+                    ),
+                    fallback_builder=lambda: _build_session_list_cache_payload(
+                        active_profile=active_profile,
+                        all_profiles=all_profiles,
+                        show_cli_sessions=False,
+                        show_previous_messaging_sessions=show_previous_messaging_sessions,
+                        show_cron_sessions=show_cron_sessions,
+                        include_archived=include_archived,
+                        exclude_hidden=exclude_hidden,
+                        visible_only=True,
+                        show_webhook_sessions=show_webhook_sessions,
+                        show_kanban_sessions=show_kanban_sessions,
+                        source_filter=agent_session_source_filter,
+                        sidebar_source=sidebar_source,
+                        archived_limit=archived_limit,
+                        archived_offset=archived_offset,
+                        diag=diag,
+                    ),
                     diag=diag,
-                ),
-                fallback_builder=lambda: _build_session_list_cache_payload(
-                    active_profile=active_profile,
-                    all_profiles=all_profiles,
-                    show_cli_sessions=False,
-                    show_previous_messaging_sessions=show_previous_messaging_sessions,
-                    show_cron_sessions=show_cron_sessions,
-                    include_archived=include_archived,
-                    exclude_hidden=exclude_hidden,
-                    visible_only=True,
-                    show_webhook_sessions=show_webhook_sessions,
-                    show_kanban_sessions=show_kanban_sessions,
-                    source_filter=agent_session_source_filter,
-                    sidebar_source=sidebar_source,
-                    archived_limit=archived_limit,
-                    archived_offset=archived_offset,
-                    diag=diag,
-                ),
-                diag=diag,
-            )
+                )
+            except Exception as exc:
+                # Cache plumbing and builder handoff failures are not user-level
+                # request errors.  Keep the sidebar contract alive and log the
+                # exact cause; bad query/auth handling has already completed.
+                logger.warning(
+                    "Bounded session-list payload failed; serving degraded index payload",
+                    exc_info=True,
+                )
+                payload = degraded_payload()
+                payload["error"] = type(exc).__name__
+                builder_error = exc
             diag.stage("response_write")
-            return j(handler, _session_list_payload_to_response(payload), pretty=False)
+            try:
+                response_payload = _session_list_payload_to_response(payload)
+                extra_headers = (
+                    {"X-WebUI-List-Degraded": "1"} if response_payload.get("degraded") else None
+                )
+                degraded_token = _SESSION_LIST_RESPONSE_DEGRADED.set(
+                    bool(response_payload.get("degraded"))
+                )
+                try:
+                    return j(
+                        handler,
+                        response_payload,
+                        extra_headers=extra_headers,
+                        pretty=False,
+                    )
+                finally:
+                    _SESSION_LIST_RESPONSE_DEGRADED.reset(degraded_token)
+            except Exception:
+                # Projection/serialization can fail before j() sends headers.  A
+                # non-JSON value from one bad persisted row must not become a
+                # sidebar 500 after the builder already supplied usable rows.
+                if getattr(handler, "status", None) is not None:
+                    raise
+                logger.warning(
+                    "Session-list response serialization failed; serving empty degraded payload",
+                    exc_info=True,
+                )
+                failure = builder_error or exc
+                degraded_token = _SESSION_LIST_RESPONSE_DEGRADED.set(True)
+                try:
+                    return j(
+                        handler,
+                        {
+                            "sessions": [],
+                            "sidebar_reference_sessions": [],
+                            "cli_count": 0,
+                            "archived_count": 0,
+                            "archived_webui_count": 0,
+                            "archived_cli_count": 0,
+                            "include_archived": include_archived,
+                            "all_profiles": all_profiles,
+                            "active_profile": active_profile,
+                            "other_profile_count": 0,
+                            "server_time": time.time(),
+                            "server_tz": time.strftime("%z"),
+                            "degraded": True,
+                            "degraded_reason": "response_serialization",
+                            "error": type(failure).__name__,
+                        },
+                        extra_headers={"X-WebUI-List-Degraded": "1"},
+                        pretty=False,
+                    )
+                finally:
+                    _SESSION_LIST_RESPONSE_DEGRADED.reset(degraded_token)
         finally:
             diag.finish()
 
