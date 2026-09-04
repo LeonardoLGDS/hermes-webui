@@ -114,6 +114,10 @@ def route_state(monkeypatch, tmp_path):
     monkeypatch.setattr(helpers, "flush_pending_auth_cookies", lambda handler: None)
     monkeypatch.setattr(wsbound, "RESPONSES", ByteLRU(1024 * 1024))
     monkeypatch.setattr(wsbound, "COMPILES", AdmissionGate(512 * 1024 * 1024))
+    monkeypatch.setattr(wsbound, "POLL_COOLDOWNS", ByteLRU(16384))
+    # WHY: process-local route registries must not leak between HTTP tests.
+    with wsbound.SESSION_LOAD_FLIGHT_LOCK:
+        wsbound.SESSION_LOAD_FLIGHTS.clear()
     return routes, profiles, wsbound, tmp_path
 
 
@@ -256,3 +260,88 @@ def test_concurrent_visible_session_reads_are_admitted(route_state, monkeypatch)
     # WHY: exempting the foreground must not weaken the background-poll floor.
     assert [handler.status for handler in hidden] == [200, 429]
     assert 1 <= int(hidden[1].response_headers["Retry-After"]) <= 60
+
+
+def test_session_poll_joins_identical_inflight_open(route_state, monkeypatch):
+    routes, profiles, wsbound, directory = route_state
+    (directory / "sample.json").write_text("{}")
+    entered = threading.Event()
+    release = threading.Event()
+    joined = threading.Event()
+    calls = []
+
+    def compile_response(handler, parsed):
+        calls.append(handler)
+        entered.set()
+        assert release.wait(2)
+        return routes.j(handler, {"session": {"session_id": "sample"}})
+
+    monkeypatch.setattr(routes, "_handle_get_impl", compile_response)
+    original_join = wsbound.join_session_load
+
+    def signed_join(flight):
+        joined.set()
+        return original_join(flight)
+
+    monkeypatch.setattr(wsbound, "join_session_load", signed_join)
+    path = "/api/session?session_id=sample"
+    leader = Handler(path)
+    follower = Handler(path, {"X-WebUI-Poll": "visible"})
+    leader_thread = threading.Thread(target=routes.handle_get, args=(leader, urlparse(path)))
+    leader_thread.start()
+    assert entered.wait(1)
+    follower_thread = threading.Thread(target=routes.handle_get, args=(follower, urlparse(path)))
+    follower_thread.start()
+    assert joined.wait(1)
+    release.set()
+    leader_thread.join(2)
+    follower_thread.join(2)
+    assert not leader_thread.is_alive() and not follower_thread.is_alive()
+
+    # WHY: the 09-04 failure was not merely status 429; identical impatient
+    # reads duplicated a 3-15s open. A join must reuse one underlying load.
+    assert leader.status == follower.status == 200
+    assert len(calls) == 1
+    assert follower.response_headers["X-WebUI-Single-Flight"] == "join"
+    assert follower.wfile.getvalue() == leader.wfile.getvalue()
+    assert wsbound.SESSION_LOAD_FLIGHTS == {}
+
+
+def test_session_poll_join_has_bounded_pending_fallback(route_state, monkeypatch):
+    routes, profiles, wsbound, directory = route_state
+    (directory / "sample.json").write_text("{}")
+    monkeypatch.setattr(wsbound, "SESSION_LOAD_JOIN_TIMEOUT", 0.01)
+    entered = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    def compile_response(handler, parsed):
+        calls.append(handler)
+        entered.set()
+        assert release.wait(2)
+        return routes.j(handler, {"session": {"session_id": "sample"}})
+
+    monkeypatch.setattr(routes, "_handle_get_impl", compile_response)
+    path = "/api/session?session_id=sample"
+    leader = Handler(path)
+    follower = Handler(path, {"X-WebUI-Poll": "visible"})
+    leader_thread = threading.Thread(target=routes.handle_get, args=(leader, urlparse(path)))
+    leader_thread.start()
+    assert entered.wait(1)
+    follower_thread = threading.Thread(target=routes.handle_get, args=(follower, urlparse(path)))
+    follower_thread.start()
+    follower_thread.join(1)
+    assert not follower_thread.is_alive()
+    release.set()
+    leader_thread.join(2)
+    assert not leader_thread.is_alive()
+
+    # WHY: a leader wedged past the ceiling must leave polling clients in a
+    # retryable loading state, never the UI's failed-session 429 path.
+    assert follower.status == 202
+    assert follower.response_headers["Retry-After"] == "1"
+    assert json.loads(follower.wfile.getvalue()) == {"session_load": "in_progress"}
+    assert follower.response_headers["X-WebUI-Single-Flight"] == "join"
+    assert leader.status == 200
+    assert len(calls) == 1
+    assert wsbound.SESSION_LOAD_FLIGHTS == {}

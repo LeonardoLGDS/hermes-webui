@@ -200,11 +200,64 @@ class AdmissionGate:
 RESPONSES = ByteLRU(int(os.getenv("HERMES_WEBUI_CACHE_BYTES", "268435456")))
 POLL_COOLDOWNS = ByteLRU(1024 * 1024)
 COMPILES = AdmissionGate(int(os.getenv("HERMES_WEBUI_INFLIGHT_BYTES", "536870912")))
+SESSION_LOAD_JOIN_TIMEOUT = 20.0
+SESSION_LOAD_FLIGHT_LIMIT = 256
+SESSION_LOAD_PENDING_BODY = b'{"session_load":"in_progress"}'
+SESSION_LOAD_FLIGHTS = {}
+SESSION_LOAD_FLIGHT_LOCK = threading.Lock()
 NORMAL_CACHE_BYTES = RESPONSES.capacity
 NORMAL_INFLIGHT_BYTES = COMPILES.budget
 PRESSURE_STATE = None
 REDACT_RULESET_VERSION = 1
 VIEW_SCHEMA_VERSION = 1
+
+
+class SessionLoadFlight:
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+
+    def record(self, body, status):
+        self.result = (body, status)
+
+
+def claim_session_load(key):
+    """Return ``(flight, is_leader)`` for an exact response-key session read.
+
+    ``None, False`` means the process-wide unique-key cap is full. That is an
+    abuse/resource boundary, deliberately distinct from an identical-reader join.
+    """
+    with SESSION_LOAD_FLIGHT_LOCK:
+        flight = SESSION_LOAD_FLIGHTS.get(key)
+        if flight is not None:
+            return flight, False
+        if len(SESSION_LOAD_FLIGHTS) >= SESSION_LOAD_FLIGHT_LIMIT:
+            return None, False
+        flight = SessionLoadFlight()
+        # WHY: exact keys make this a response replay, not generic session
+        # coalescing; differing query/profile/source stamps still get isolation.
+        SESSION_LOAD_FLIGHTS[key] = flight
+        return flight, True
+
+
+def join_session_load(flight):
+    """Bounded-wait for the leader, then expose pending rather than 429."""
+    completed = flight.event.wait(SESSION_LOAD_JOIN_TIMEOUT)
+    with SESSION_LOAD_FLIGHT_LOCK:
+        if completed and flight.result is not None:
+            return flight.result, True
+    return (SESSION_LOAD_PENDING_BODY, 202), False
+
+
+def finish_session_load(key, flight):
+    with SESSION_LOAD_FLIGHT_LOCK:
+        if flight.result is None:
+            # Unexpected/no-response leader paths must never strand followers
+            # until socket timeout; pending is retryable and client-safe.
+            flight.result = (SESSION_LOAD_PENDING_BODY, 202)
+        flight.event.set()
+        if SESSION_LOAD_FLIGHTS.get(key) is flight:
+            del SESSION_LOAD_FLIGHTS[key]
 
 
 def admit_poll(key, visibility):

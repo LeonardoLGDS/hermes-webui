@@ -13095,8 +13095,9 @@ def handle_get(handler, parsed) -> bool:
     from api.wsbound import (RESPONSES, COMPILES, MemoryBudgetExceeded, DERIVED_READ, RESPONSE_CAPTURE,
                              READ_BUDGET, ReadBudget,
                              SnapshotPending, WindowTooLarge, etag, pressure_health, admit_poll,
-                             path_stamp, REDACT_RULESET_VERSION, VIEW_SCHEMA_VERSION)
-    from api.helpers import send_json_bytes
+                             path_stamp, REDACT_RULESET_VERSION, VIEW_SCHEMA_VERSION,
+                             claim_session_load, finish_session_load, join_session_load)
+    from api.helpers import send_json_bytes, _json_response_body
     from api.profiles import get_active_profile_name, get_active_hermes_home
     query = parse_qs(parsed.query)
     health = pressure_health()
@@ -13128,39 +13129,76 @@ def handle_get(handler, parsed) -> bool:
         if parsed.path == "/api/sessions" and handler.headers.get("If-None-Match") == etag(blob):
             return send_json_bytes(handler, b"", status=304, extra_headers={"ETag": etag(blob)})
         return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
-    # WHY: gate BEFORE get_session, not just serialization. A 12x expansion
-    # estimate plus fixed DB/display allowance bounds concurrent legacy loads.
-    read_bytes = max(8 * 1024 * 1024, source[2] * 2)
-    cost = read_bytes * 12
-    if parsed.path == "/api/sessions":
-        cost = 128 * 1024 * 1024
+    flight = None
+    if parsed.path == "/api/session":
+        flight, is_flight_leader = claim_session_load(key)
+        if flight is None:
+            # WHY: unique-flight exhaustion is an abuse boundary. It must not
+            # reuse poll_throttled, which the UI maps to a failed session open.
+            return j(handler, {"error": "session_flight_limit"}, status=429,
+                     extra_headers={"Retry-After": "1"})
+        if not is_flight_leader:
+            (body, status), completed = join_session_load(flight)
+            extra_headers = {"X-WebUI-Single-Flight": "join"}
+            if not completed:
+                extra_headers["Retry-After"] = "1"
+            return send_json_bytes(handler, body, status, extra_headers=extra_headers)
+
+        def flight_json(payload, status=200, extra_headers=None):
+            # WHY: followers replay the leader's exact serialized result even
+            # for boundary errors, instead of independently re-entering a load.
+            flight.record(_json_response_body(payload), status)
+            return j(handler, payload, status, extra_headers=extra_headers)
     try:
-        with COMPILES.admit(cost):
-            if path_stamp(session_path) != source:
-                raise MemoryBudgetExceeded()
-            blob = RESPONSES.get(key)
-            if blob is not None:
-                return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
-            def capture(body, status):
-                if status == 200 and path_stamp(session_path) == source:
-                    RESPONSES.put(key, body, ttl=5)
-            capture_token = RESPONSE_CAPTURE.set(capture)
-            context_token = DERIVED_READ.set(True)
-            read_token = READ_BUDGET.set(ReadBudget(read_bytes))
-            try:
-                return _handle_get_impl(handler, parsed)
-            finally:
-                RESPONSE_CAPTURE.reset(capture_token)
-                DERIVED_READ.reset(context_token)
-                READ_BUDGET.reset(read_token)
-    except MemoryBudgetExceeded:
-        return j(handler, {"error": "memory_budget"}, status=429,
-                 extra_headers={"Retry-After": "2"})
-    except SnapshotPending:
-        return j(handler, {"error": "metadata_refresh_pending"}, status=503,
-                 extra_headers={"Retry-After": "2"})
-    except WindowTooLarge:
-        return j(handler, {"error": "message_window_too_large", "max_bytes": 1572864}, status=413)
+        retry = admit_poll((str(get_active_hermes_home()), get_active_profile_name(), parsed.path, sid),
+                           getattr(handler, 'headers', {}).get("X-WebUI-Poll"))
+        if retry:
+            return flight_json({"error": "poll_throttled"}, status=429,
+                               extra_headers={"Retry-After": str(retry)})
+
+        # WHY: gate BEFORE get_session, not just serialization. A 12x expansion
+        # estimate plus fixed DB/display allowance bounds concurrent legacy loads.
+        read_bytes = max(8 * 1024 * 1024, source[2] * 2)
+        cost = read_bytes * 12
+        if parsed.path == "/api/sessions":
+            cost = 128 * 1024 * 1024
+        try:
+            with COMPILES.admit(cost):
+                if path_stamp(session_path) != source:
+                    raise MemoryBudgetExceeded()
+                blob = RESPONSES.get(key)
+                if blob is not None:
+                    if flight is not None:
+                        flight.record(blob, 200)
+                    return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
+                def capture(body, status):
+                    if status == 200 and path_stamp(session_path) == source:
+                        RESPONSES.put(key, body, ttl=5)
+                    if flight is not None:
+                        flight.record(body, status)
+                capture_token = RESPONSE_CAPTURE.set(capture)
+                context_token = DERIVED_READ.set(True)
+                read_token = READ_BUDGET.set(ReadBudget(read_bytes))
+                try:
+                    return _handle_get_impl(handler, parsed)
+                finally:
+                    RESPONSE_CAPTURE.reset(capture_token)
+                    DERIVED_READ.reset(context_token)
+                    READ_BUDGET.reset(read_token)
+        except MemoryBudgetExceeded:
+            return flight_json({"error": "memory_budget"}, status=429,
+                                extra_headers={"Retry-After": "2"})
+        except SnapshotPending:
+            return flight_json({"error": "metadata_refresh_pending"}, status=503,
+                                extra_headers={"Retry-After": "2"})
+        except WindowTooLarge:
+            return flight_json({"error": "message_window_too_large", "max_bytes": 1572864},
+                               status=413)
+    finally:
+        # WHY: claim/release wraps every leader path so an identical impatient
+        # poll can never observe a stale registry entry after cancellation.
+        if flight is not None:
+            finish_session_load(key, flight)
 
 
 def _handle_get_impl(handler, parsed) -> bool:
