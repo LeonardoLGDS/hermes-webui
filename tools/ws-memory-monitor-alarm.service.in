@@ -1,0 +1,6 @@
+[Unit]
+Description=WebUI memory telemetry failure alarm (DEFERRED journal sink)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -p daemon.crit -t webui-memory CRIT telemetry-unit-failed operator-review-required no-restart-no-auto-raise

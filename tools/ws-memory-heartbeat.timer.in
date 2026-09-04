@@ -1,0 +1,11 @@
+[Unit]
+Description=Independent WebUI heartbeat schedule (DEFERRED G5)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=ws-memory-heartbeat.service
+
+[Install]
+WantedBy=timers.target

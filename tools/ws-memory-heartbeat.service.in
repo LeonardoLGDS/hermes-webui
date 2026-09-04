@@ -1,0 +1,10 @@
+[Unit]
+Description=Independent WebUI heartbeat check (DEFERRED G5)
+OnFailure=ws-memory-monitor-alarm.service
+
+[Service]
+Type=oneshot
+User=@WEBUI_USER@
+ExecStart=@PYTHON@ @SOURCE@/tools/ws_memory_monitor.py --check --state @STATE@ --log @LOG@
+TimeoutStartSec=20
+UMask=0077

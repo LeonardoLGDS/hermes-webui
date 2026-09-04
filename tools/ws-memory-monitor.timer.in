@@ -1,0 +1,11 @@
+[Unit]
+Description=WebUI one-minute samples (DEFERRED; do not combine with parent sampler)
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=1s
+Unit=ws-memory-monitor.service
+
+[Install]
+WantedBy=timers.target

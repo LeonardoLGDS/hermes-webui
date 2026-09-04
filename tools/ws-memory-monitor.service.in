@@ -1,0 +1,10 @@
+[Unit]
+Description=WebUI memory sample (DEFERRED template; replace all @tokens@)
+OnFailure=ws-memory-monitor-alarm.service
+
+[Service]
+Type=oneshot
+User=@WEBUI_USER@
+ExecStart=/bin/sh -ec 'pid=$(/usr/bin/systemctl show --value -p MainPID @WEBUI_UNIT@); test "$pid" -gt 0; exec @PYTHON@ @SOURCE@/tools/ws_memory_monitor.py --cgroup @CGROUP@ --pid "$pid" --state @STATE@ --log @LOG@'
+TimeoutStartSec=20
+UMask=0077
