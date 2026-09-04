@@ -2624,7 +2624,10 @@ function _normalizeWebUIVersion(value){
   // fire the stale-client banner. (Codex #5480 gate)
   const lower=s.toLowerCase();
   if(lower==='__webui_version__'||lower==='not detected'||lower==='unknown') return '';
-  return s;
+  // Git-derived build stamps can carry worktree/bundle digests that change
+  // independently of the deployed release. Compare only the stable base so a
+  // fresh bundle does not look stale merely because its build noise differs.
+  return s.split('+',1)[0].replace(/-dirty-.*$/, '');
 }
 
 function _currentWebUIBundleVersion(){

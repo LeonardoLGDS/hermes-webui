@@ -166,6 +166,28 @@ def test_node_equal_versions_no_banner():
     assert result["display"] != "flex", f"Banner wrongly shown for equal versions: {result}"
 
 
+def test_node_build_volatile_version_suffixes_no_banner():
+    """Dirty worktree and bundle build suffixes normalize to the same base."""
+    helpers = _extract_skew_helpers(PANELS_JS.read_text(encoding="utf-8"))
+    result = _run_harness(
+        _make_stub("a962835-dirty-86d4529f+a9d814a910b"),
+        helpers,
+        textwrap.dedent("""\
+            const client = _normalizeWebUIVersion(
+                'a962835-dirty-86d4529f+a9d814a910b'
+            );
+            const server = _normalizeWebUIVersion('a962835-dirty-86d4529f');
+            if (client !== server || client !== 'a962835') {
+                throw new Error(`unexpected normalized versions: ${client} != ${server}`);
+            }
+            checkWebUIVersionSkew({ webui_version: 'a962835-dirty-86d4529f' });
+        """),
+    )
+    assert result["display"] != "flex", (
+        f"Banner wrongly shown for build-noise-only version difference: {result}"
+    )
+
+
 def test_node_missing_server_version_no_banner():
     """Missing webui_version in settings keeps banner hidden."""
     helpers = _extract_skew_helpers(PANELS_JS.read_text(encoding="utf-8"))
