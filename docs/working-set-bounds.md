@@ -46,12 +46,15 @@ the full index as a fallback. Refresh is demand-triggered, not an independent
 five-second watcher. Existing inner metadata caches retain their compatibility
 shapes and count limits; they are not all converted to byte-LRUs in this wave.
 
-Automatic readers can send `X-WebUI-Poll: visible` or `hidden` to receive a
-five-second or 60-second server-side floor. Native external-session polling now
-marks its requests; its existing 30-second cadence and hidden-tab skip are kept.
-Pressure refuses marked polls before compile admission, while direct human reads
-still use FIFO admission. Unmarked legacy sidecars benefit from byte-cache reuse;
-their producer-side cadence/jitter/backoff must be updated separately.
+Automatic readers can send `X-WebUI-Poll: hidden` for a 60-second server-side
+floor or another non-foreground automatic marker for a five-second floor. The
+active foreground reader sends `X-WebUI-Poll: visible` and is exempt from that
+floor: its 650ms–2s cadence supports the visible conversation, and refusing it
+turns a first click into “Failed to load session.” Native external-session
+polling keeps its existing cadence and hidden-tab skip. Pressure still refuses
+marked polls before compile admission, while direct human reads use FIFO
+admission. Unmarked legacy sidecars benefit from byte-cache reuse; their
+producer-side cadence/jitter/backoff must be updated separately.
 
 ## Telemetry and rollout
 

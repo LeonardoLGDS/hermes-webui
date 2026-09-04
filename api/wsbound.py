@@ -208,7 +208,10 @@ VIEW_SCHEMA_VERSION = 1
 
 
 def admit_poll(key, visibility):
-    if not visibility:
+    # WHY: `visible` is the active foreground reader. It must not consume the
+    # automatic-poll floor: the desktop app probes that session every 650ms–2s,
+    # so throttling it turns a first click into "Failed to load session".
+    if not visibility or visibility == "visible":
         return 0
     delay = 60 if visibility == "hidden" else 5
     # WHY: the 650ms sidecar loop amplified 09-03 throttling. Only marked

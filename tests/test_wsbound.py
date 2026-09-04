@@ -212,8 +212,47 @@ def test_sql_history_budget_refusal_is_not_swallowed_as_empty(monkeypatch, tmp_p
 def test_marked_polls_throttle_but_humans_do_not(monkeypatch):
     from api import wsbound
     monkeypatch.setattr(wsbound, "POLL_COOLDOWNS", ByteLRU(16384))
+    # WHY: visible is the foreground marker sent by the active-session reader;
+    # its 650ms–2s cadence is a human-visible read, not a background poll.
     assert wsbound.admit_poll(("profile", "sid"), "visible") == 0
-    assert 1 <= wsbound.admit_poll(("profile", "sid"), "visible") <= 5
+    assert wsbound.admit_poll(("profile", "sid"), "visible") == 0
     assert wsbound.admit_poll(("profile", "sid"), "") == 0
     assert wsbound.admit_poll(("profile", "other"), "hidden") == 0
     assert 1 <= wsbound.admit_poll(("profile", "other"), "hidden") <= 60
+    assert wsbound.admit_poll(("profile", "auto"), "auto") == 0
+    assert 1 <= wsbound.admit_poll(("profile", "auto"), "auto") <= 5
+
+
+def test_concurrent_visible_session_reads_are_admitted(route_state, monkeypatch):
+    routes, profiles, wsbound, directory = route_state
+    (directory / "sample.json").write_text("{}")
+
+    def compile_response(handler, parsed):
+        return routes.j(handler, {"session": {"session_id": "sample"}})
+
+    monkeypatch.setattr(
+        routes,
+        "_handle_get_impl",
+        compile_response,
+    )
+    path = "/api/session?session_id=sample"
+    handlers = [Handler(path, {"X-WebUI-Poll": "visible"}) for _ in range(2)]
+    threads = [
+        threading.Thread(target=routes.handle_get, args=(handler, urlparse(path)))
+        for handler in handlers
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(2)
+        assert not thread.is_alive()
+    # WHY: first-click 429s turned an active-session poll into the UI's
+    # "Failed to load session"; both foreground reads must pass the boundary.
+    assert sorted(handler.status for handler in handlers) == [200, 200]
+
+    hidden = [Handler(path, {"X-WebUI-Poll": "hidden"}) for _ in range(2)]
+    for handler in hidden:
+        routes.handle_get(handler, urlparse(path))
+    # WHY: exempting the foreground must not weaken the background-poll floor.
+    assert [handler.status for handler in hidden] == [200, 429]
+    assert 1 <= int(hidden[1].response_headers["Retry-After"]) <= 60
