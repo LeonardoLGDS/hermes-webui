@@ -10192,7 +10192,12 @@ def _message_summary(messages) -> dict:
     return {"message_count": len(messages), "last_message_at": last_message_at}
 
 
-def _metadata_only_message_summary(sid: str, profile: str | None = None) -> dict:
+def _metadata_only_message_summary(
+    sid: str,
+    profile: str | None = None,
+    *,
+    sidecar_session=None,
+) -> dict:
     """Return the cheap message summary used by metadata-only session loads.
 
     Threads ``profile=`` through to ``get_state_db_session_summary`` so
@@ -10206,7 +10211,8 @@ def _metadata_only_message_summary(sid: str, profile: str | None = None) -> dict
     sidecar count, keep the sidecar metadata so polling does not loop forever on
     a false "newer transcript" signal.
     """
-    sidecar_session = Session.load_metadata_only(sid)
+    if sidecar_session is None:
+        sidecar_session = Session.load_metadata_only(sid)
     sidecar_count = 0
     sidecar_last_message_at = 0.0
     if sidecar_session:
@@ -11144,6 +11150,187 @@ def _sidebar_session_response_item(
         )
     )
     return item
+
+
+def _metadata_open_list_cache_key(active_profile: str | None) -> tuple | None:
+    """Build the canonical visible-sidebar key used to serve metadata opens."""
+    try:
+        settings = load_settings()
+    except Exception:
+        return None
+    return _session_list_cache_key(
+        active_profile=active_profile,
+        all_profiles=False,
+        show_cli_sessions=bool(settings.get("show_cli_sessions")),
+        show_previous_messaging_sessions=bool(
+            settings.get("show_previous_messaging_sessions")
+        ),
+        show_cron_sessions=bool(settings.get("show_cron_sessions")),
+        include_archived=False,
+        exclude_hidden=True,
+        visible_only=True,
+        show_webhook_sessions=bool(settings.get("show_webhook_sessions")),
+        show_kanban_sessions=bool(settings.get("show_kanban_sessions")),
+        source_filter=settings.get("agent_session_source_filter"),
+        sidebar_source="webui",
+    )
+
+
+def _metadata_open_row_from_list_payload(
+    payload: dict | None,
+    sid: str,
+    handler,
+    *,
+    allow_degraded: bool = False,
+) -> dict | None:
+    """Project one safe sidebar row into a metadata-open session."""
+    payload_degraded = bool(isinstance(payload, dict) and payload.get("degraded"))
+    if not isinstance(payload, dict) or (payload_degraded and not allow_degraded):
+        return None
+    rows = payload.get("sessions")
+    if not isinstance(rows, list):
+        return None
+    row = next(
+        (
+            candidate
+            for candidate in rows
+            if isinstance(candidate, dict)
+            and str(candidate.get("session_id") or "") == sid
+        ),
+        None,
+    )
+    if row is None or not _session_visible_to_active_profile(row.get("profile"), handler):
+        # Foreign/unknown-profile cache rows must not replace the detail route's
+        # real 404/409 semantics.  Fall through to the normal sidecar path.
+        return None
+    try:
+        overlaid = _session_list_cache_overlay_runtime_rows([dict(row)])[0]
+        try:
+            redact_enabled = bool(load_settings().get("api_redact_enabled", True))
+        except Exception:
+            redact_enabled = True
+        item = _sidebar_session_response_item(overlaid, redact_enabled=redact_enabled)
+    except Exception:
+        logger.warning("Session metadata list-cache projection failed", exc_info=True)
+        return None
+
+    item["message_count"] = _numeric_count(item.get("message_count"))
+    for field in ("created_at", "updated_at", "last_message_at", "pending_started_at"):
+        if field in item:
+            item[field] = _session_list_row_numeric_value(item.get(field))
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+    ):
+        if field in item:
+            item[field] = _numeric_count(item.get(field))
+    for field in (
+        "estimated_cost",
+        "cache_hit_percent",
+        "window_usage_percent",
+    ):
+        if field in item:
+            item[field] = _session_list_row_numeric_value(item.get(field))
+    for field in (
+        "is_streaming",
+        "cron_running",
+        "bg_active",
+        "has_pending_user_message",
+        "read_only",
+        "is_read_only",
+        "archived",
+    ):
+        if field in item:
+            item[field] = bool(item.get(field))
+
+    item["messages"] = []
+    item["tool_calls"] = []
+    item["pending_attachments"] = []
+    item["_messages_truncated"] = False
+    item["_messages_offset"] = 0
+    item["_msg_limit_max"] = _MAX_MSG_LIMIT
+    if payload_degraded:
+        item["_metadata_response_degraded"] = True
+        item["_metadata_degraded_reason"] = "session_list_cache_degraded"
+    return item
+
+
+def _degraded_metadata_open_payload(
+    sid: str,
+    handler,
+    active_profile: str | None,
+) -> dict:
+    """Return a clearly non-authoritative metadata payload after a budget refusal."""
+    row = None
+    key = _metadata_open_list_cache_key(active_profile)
+    if key is not None:
+        stale_payload, _fresh = _session_list_cache_get(key, allow_stale=True)
+        row = _metadata_open_row_from_list_payload(
+            stale_payload,
+            sid,
+            handler,
+            allow_degraded=True,
+        )
+    if row is None:
+        from api.wsbound import MemoryBudgetExceeded, READ_BUDGET, ReadBudget
+
+        token = READ_BUDGET.set(ReadBudget(8 * 1024 * 1024))
+        try:
+            index_payload = _degraded_session_list_payload_from_index(
+                active_profile=active_profile,
+                all_profiles=False,
+                show_cli_sessions=False,
+                show_previous_messaging_sessions=False,
+                show_cron_sessions=False,
+                show_claude_code_sessions=False,
+                include_archived=False,
+                exclude_hidden=True,
+                show_webhook_sessions=False,
+                show_kanban_sessions=False,
+                sidebar_source="webui",
+                archived_limit=None,
+                archived_offset=0,
+            )
+        except (Exception, MemoryBudgetExceeded):
+            logger.warning(
+                "Session metadata degraded index fallback failed", exc_info=True
+            )
+            index_payload = None
+        finally:
+            READ_BUDGET.reset(token)
+        row = _metadata_open_row_from_list_payload(
+            index_payload,
+            sid,
+            handler,
+            allow_degraded=True,
+        )
+    if row is None:
+        # This is deliberately not an authoritative empty transcript: every
+        # count/history field is marked degraded and the client retains its
+        # existing data until a later metadata read succeeds.
+        row = {
+            "session_id": sid,
+            "title": "Session unavailable",
+            "message_count": 0,
+            "created_at": 0.0,
+            "updated_at": 0.0,
+            "last_message_at": 0.0,
+        }
+    row["messages"] = []
+    row["tool_calls"] = []
+    row["pending_attachments"] = []
+    row["_messages_truncated"] = False
+    row["_messages_offset"] = 0
+    row["_msg_limit_max"] = _MAX_MSG_LIMIT
+    row["_metadata_response_degraded"] = True
+    row["_metadata_degraded_reason"] = "memory_budget"
+    return {
+        "session": row,
+        "degraded": True,
+        "degraded_reason": "metadata_memory_budget",
+    }
 
 
 def _redact_sidebar_title_fields(item: dict, redact_enabled: bool | None = None) -> None:
@@ -13301,8 +13488,12 @@ def handle_get(handler, parsed) -> bool:
     from api.helpers import send_json_bytes, _json_response_body
     from api.profiles import get_active_profile_name, get_active_hermes_home
     query = parse_qs(parsed.query)
+    metadata_only = (
+        parsed.path == "/api/session"
+        and query.get("messages", ["1"])[0] == "0"
+    )
     health = pressure_health()
-    if health["shed"] and getattr(handler, 'headers', {}).get("X-WebUI-Poll"):
+    if health["shed"] and not metadata_only and getattr(handler, 'headers', {}).get("X-WebUI-Poll"):
         return j(handler, {"error": "memory_pressure"}, status=429,
                  extra_headers={"Retry-After": "60"})
     if query.get("full", ["0"])[0] == "1":
@@ -13330,6 +13521,47 @@ def handle_get(handler, parsed) -> bool:
         if parsed.path == "/api/sessions" and handler.headers.get("If-None-Match") == etag(blob):
             return send_json_bytes(handler, b"", status=304, extra_headers={"ETag": etag(blob)})
         return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
+
+    if metadata_only:
+        active_profile = get_active_profile_name()
+        list_key = _metadata_open_list_cache_key(active_profile)
+        if list_key is not None:
+            list_payload, list_fresh = _session_list_cache_get(list_key, allow_stale=False)
+            if list_fresh:
+                cached_session = _metadata_open_row_from_list_payload(
+                    list_payload,
+                    sid,
+                    handler,
+                    allow_degraded=True,
+                )
+                if cached_session is not None:
+                    list_payload_degraded = bool(list_payload.get("degraded"))
+
+                    def capture_metadata(body, status):
+                        if (
+                            status == 200
+                            and not list_payload_degraded
+                            and path_stamp(session_path) == source
+                        ):
+                            RESPONSES.put(key, body, ttl=5)
+
+                    metadata_capture_token = RESPONSE_CAPTURE.set(capture_metadata)
+                    metadata_body = {"session": cached_session}
+                    metadata_headers = {
+                        "X-WebUI-Metadata-Cache": "session-list",
+                    }
+                    if list_payload_degraded:
+                        metadata_body["degraded"] = True
+                        metadata_body["degraded_reason"] = "session_list_cache_degraded"
+                        metadata_headers["X-WebUI-Session-Metadata-Degraded"] = "1"
+                    try:
+                        return j(
+                            handler,
+                            metadata_body,
+                            extra_headers=metadata_headers,
+                        )
+                    finally:
+                        RESPONSE_CAPTURE.reset(metadata_capture_token)
     flight = None
 
     def flight_json(payload, status=200, extra_headers=None):
@@ -13343,7 +13575,7 @@ def handle_get(handler, parsed) -> bool:
             flight.record(_json_response_body(payload), status)
         return j(handler, payload, status, extra_headers=extra_headers)
 
-    if parsed.path == "/api/session":
+    if parsed.path == "/api/session" and not metadata_only:
         flight, is_flight_leader = claim_session_load(key)
         if flight is None:
             # WHY: unique-flight exhaustion is an abuse boundary. It must not
@@ -13357,11 +13589,32 @@ def handle_get(handler, parsed) -> bool:
                 extra_headers["Retry-After"] = "1"
             return send_json_bytes(handler, body, status, extra_headers=extra_headers)
     try:
-        retry = admit_poll((str(get_active_hermes_home()), get_active_profile_name(), parsed.path, sid),
-                           getattr(handler, 'headers', {}).get("X-WebUI-Poll"))
-        if retry:
-            return flight_json({"error": "poll_throttled"}, status=429,
-                               extra_headers={"Retry-After": str(retry)})
+        if metadata_only:
+            # Metadata opens are cache/sidecar reads, not graph compiles.  They
+            # must not queue behind (or be shed by) full-open admission; the one
+            # hidden-auto admission gate above remains the only 429 boundary.
+            read_bytes = max(8 * 1024 * 1024, source[2] * 2)
+            capture_token = RESPONSE_CAPTURE.set(
+                lambda body, status: (
+                    RESPONSES.put(key, body, ttl=5)
+                    if status == 200 and path_stamp(session_path) == source
+                    else None
+                )
+            )
+            context_token = DERIVED_READ.set(True)
+            read_token = READ_BUDGET.set(ReadBudget(read_bytes))
+            try:
+                return _handle_get_impl(handler, parsed)
+            finally:
+                RESPONSE_CAPTURE.reset(capture_token)
+                DERIVED_READ.reset(context_token)
+                READ_BUDGET.reset(read_token)
+        else:
+            retry = admit_poll((str(get_active_hermes_home()), get_active_profile_name(), parsed.path, sid),
+                               getattr(handler, 'headers', {}).get("X-WebUI-Poll"))
+            if retry:
+                return flight_json({"error": "poll_throttled"}, status=429,
+                                   extra_headers={"Retry-After": str(retry)})
 
         # WHY: gate BEFORE get_session, not just serialization. A 12x expansion
         # estimate plus fixed DB/display allowance bounds concurrent legacy loads.
@@ -13397,6 +13650,22 @@ def handle_get(handler, parsed) -> bool:
                     DERIVED_READ.reset(context_token)
                     READ_BUDGET.reset(read_token)
         except MemoryBudgetExceeded:
+            if metadata_only:
+                if path_stamp(session_path) != source:
+                    return flight_json(
+                        {"error": "metadata_refresh_pending"},
+                        status=503,
+                        extra_headers={"Retry-After": "2"},
+                    )
+                return j(
+                    handler,
+                    _degraded_metadata_open_payload(
+                        sid,
+                        handler,
+                        get_active_profile_name(),
+                    ),
+                    extra_headers={"X-WebUI-Session-Metadata-Degraded": "1"},
+                )
             return flight_json({"error": "memory_budget"}, status=429,
                                 extra_headers={"Retry-After": "2"})
         except SnapshotPending:
@@ -14155,7 +14424,11 @@ def _handle_get_impl(handler, parsed) -> bool:
                 # state.db rows do not make sidebar polling think the
                 # transcript is always newer. Helper threads profile= to
                 # honor #2827's TLS-vs-thread fix.
-                metadata_summary = _metadata_only_message_summary(sid, profile=_session_profile)
+                metadata_summary = _metadata_only_message_summary(
+                    sid,
+                    profile=_session_profile,
+                    sidecar_session=s,
+                )
             _t2 = _time.monotonic()
             if _diag: _diag.stage("t2_after_state_db_load")
             effective_model = (

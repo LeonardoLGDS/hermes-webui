@@ -222,3 +222,119 @@ def test_one_bad_response_row_cannot_fail_the_whole_list(list_route_state, monke
     assert by_id["bad-row"]["title"] == "Session unavailable"
     assert by_id["bad-row"]["_sidebar_response_degraded"] is True
     assert response["degraded"] is True
+
+
+def test_metadata_open_cache_miss_reads_oversized_sidecar_once(list_route_state, monkeypatch):
+    routes, wsbound, directory = list_route_state
+    from api import models
+
+    sid = "metadata-open-once"
+    record = {
+        "session_id": sid,
+        "title": "Cached metadata",
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "profile": "default",
+        "message_count": 2,
+        "context_length": 128000,
+        "threshold_tokens": 1000,
+        # This oversized pre-messages field defeats the 64-KiB prefix scanner and
+        # reproduces the legacy full-read fallback without shipping a real transcript.
+        "tool_calls": [{"blob": "x" * 70000}],
+        "messages": [
+            {"role": "user", "content": "hello", "timestamp": 150.0},
+            {"role": "assistant", "content": "hi", "timestamp": 200.0},
+        ],
+    }
+    (directory / f"{sid}.json").write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(models, "SESSION_DIR", directory)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", directory / "_index.json")
+
+    calls = []
+    original_loader = models.Session.load_metadata_only
+
+    def counted_loader(session_id, *args, **kwargs):
+        calls.append(session_id)
+        return original_loader(session_id, *args, **kwargs)
+
+    monkeypatch.setattr(models.Session, "load_metadata_only", staticmethod(counted_loader))
+    refusing_gate = wsbound.AdmissionGate(512 * 1024 * 1024)
+    monkeypatch.setattr(
+        refusing_gate,
+        "admit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("metadata admitted")),
+    )
+    monkeypatch.setattr(wsbound, "COMPILES", refusing_gate)
+    with wsbound.SESSION_LOAD_FLIGHT_LOCK:
+        wsbound.SESSION_LOAD_FLIGHTS.clear()
+
+    handler = _Handler(f"/api/session?session_id={sid}&messages=0&resolve_model=0")
+    routes.handle_get(handler, urlparse(handler.path))
+
+    body = handler.json_body()
+    assert handler.status == 200
+    assert calls == [sid]
+    assert body["session"]["session_id"] == sid
+    assert body["session"]["message_count"] == 2
+    assert body["session"]["messages"] == []
+    assert wsbound.SESSION_LOAD_FLIGHTS == {}
+
+
+def test_metadata_open_uses_fresh_list_cache_without_sidecar_read(list_route_state, monkeypatch):
+    routes, wsbound, _directory = list_route_state
+    from api import models
+
+    sid = "metadata-open-cache"
+    row = {
+        "session_id": sid,
+        "title": "List-cache metadata",
+        "profile": "default",
+        "message_count": 7,
+        "created_at": 100.0,
+        "updated_at": 200.0,
+        "last_message_at": 200.0,
+        "is_streaming": False,
+        "cron_running": False,
+    }
+    key = routes._metadata_open_list_cache_key("default")
+    assert key is not None
+    routes._session_list_cache_set(
+        key,
+        {
+            "sessions": [row],
+            "sidebar_reference_sessions": [],
+            "cli_count": 0,
+            "webui_session_count": 1,
+            "active_profile": "default",
+        },
+    )
+
+    calls = []
+
+    def refusing_loader(session_id, *_args, **_kwargs):
+        calls.append(session_id)
+        raise AssertionError("fresh list cache must not read the sidecar")
+
+    monkeypatch.setattr(models.Session, "load_metadata_only", staticmethod(refusing_loader))
+    refusing_gate = wsbound.AdmissionGate(512 * 1024 * 1024)
+    monkeypatch.setattr(
+        refusing_gate,
+        "admit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("metadata admitted")),
+    )
+    monkeypatch.setattr(wsbound, "COMPILES", refusing_gate)
+    with wsbound.SESSION_LOAD_FLIGHT_LOCK:
+        wsbound.SESSION_LOAD_FLIGHTS.clear()
+
+    handler = _Handler(f"/api/session?session_id={sid}&messages=0&resolve_model=0")
+    routes.handle_get(handler, urlparse(handler.path))
+
+    body = handler.json_body()
+    assert handler.status == 200
+    assert calls == []
+    assert body["session"]["session_id"] == sid
+    assert body["session"]["title"] == "List-cache metadata"
+    assert body["session"]["message_count"] == 7
+    assert body["session"]["messages"] == []
+    assert handler.response_headers["X-WebUI-Metadata-Cache"] == "session-list"
+    assert wsbound.SESSION_LOAD_FLIGHTS == {}
