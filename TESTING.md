@@ -2004,6 +2004,34 @@ Bridged CLI sessions:
 
 ---
 
+### Reasoning-only historical tail display
+
+Limited display windows ignore bodyless assistant reasoning when counting reply
+rows. They search at most 4096 trailing source rows, return at most 500 contiguous
+raw rows, and retain the existing 1.5 MiB message-payload ceiling. Date separators
+follow rendered reply/media/status content, not hidden reasoning anchors. These
+are display-only rules; persisted transcripts and model context are unchanged.
+
+Run `./scripts/test.sh -q tests/test_reasoning_tail_display.py
+tests/test_session_message_window_renderable_tail.py` for window/cursor regressions.
+An optional `DISPLAY_SESSION_FIXTURE` points to the private incident fixture outside
+Git; failures must not dump its message contents.
+
+`tests/browser_reasoning_tail_display.py` reuses the historical hydration gate's
+server launcher. With `--fixture PATH --artifacts DIRECTORY`, it boots an isolated
+candidate with no model runtime, rejects outbound server connections and browser
+writes, and checks desktop/mobile initial open, reload, older history, and the End
+control. Playwright and Chromium are prerequisites. Screenshots contain private
+conversation text: keep the artifact directory outside Git and do not publish it.
+`--controlled-checks` additionally verifies hidden-tail dates and active-stream
+field preservation in browser memory; it is not a live-run proof.
+
+For an authorized, read-only deployed check, pass `--base-url ORIGIN --session-id ID
+--artifacts DIRECTORY` instead. If needed, `--auth-env VARIABLE_NAME` reads an
+existing authorized Cookie header from that environment variable, sends it only
+to the selected origin, and never saves it. Do not put credentials in arguments,
+URLs, reports, or browser storage files. The fixture remains optional in this mode.
+
 *Last updated: v0.51.792, July 1, 2026*
 *Total automated tests collected: ~11,500 (run `./scripts/test.sh tests/ --collect-only -q` for the exact current count)*
 *Regression gate: tests/test_regressions.py*

@@ -17004,18 +17004,6 @@ function renderMessages(options){
       inner.appendChild(_messageVirtualSpacer(virtualWindow.bottomPad,'after'));
     }
     const {m,rawIdx}=renderVisWithIdx[vi];
-    const _tsSep=m._ts||m.timestamp;
-    if(_tsSep){
-      const _d=new Date(_tsSep*1000);
-      const _key=_d.toDateString();
-      if(_prevSepKey && _prevSepKey!==_key){
-        const sep=document.createElement('div');
-        sep.className='msg-date-sep';
-        sep.textContent=_fmtDateSep(_d);
-        inner.appendChild(sep);
-      }
-      _prevSepKey=_key;
-    }
     let content=m.content||'';
     let thinkingText='';
     let orderedTransparentParts=_transparentStreamOrderedParts(m);
@@ -17116,6 +17104,21 @@ function renderMessages(options){
     const recoveryHtml=recoveryPayload ? _compressionRecoveryHtml(recoveryPayload, (S.session&&S.session.session_id)||'') : '';
     if(recoveryHtml) bodyHtml += recoveryHtml;
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
+    const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
+    const dateHasVisibleBody=!messageBelongsInWorklog&&!!(String((isUser?displayContent:content)||'').trim()||filesHtml||recoveryHtml||statusHtml||m.provider_details);
+    const dateTimestamp=m._ts||m.timestamp;
+    if(dateHasVisibleBody&&dateTimestamp){
+      const date=new Date(dateTimestamp*1000);
+      const dateKey=date.toDateString();
+      if(_prevSepKey&&_prevSepKey!==dateKey){
+        const separator=document.createElement('div');
+        separator.className='msg-date-sep';
+        separator.textContent=_fmtDateSep(date);
+        inner.appendChild(separator);
+        currentAssistantTurn=null;
+      }
+      _prevSepKey=dateKey;
+    }
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
@@ -17348,7 +17351,6 @@ function renderMessages(options){
     seg.dataset.rawText=String(content).trim();
     if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
     if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
-    const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
     if(messageBelongsInWorklog){
       seg.classList.add('assistant-segment-worklog-source');
       seg.setAttribute('aria-hidden','true');

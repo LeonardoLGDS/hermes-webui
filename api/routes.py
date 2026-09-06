@@ -9059,6 +9059,21 @@ def _message_counts_as_renderable_for_window(message) -> bool:
     if _is_empty_partial_activity_message(message):
         return False
     role = str(message.get("role") or "").strip().lower()
+    if role == "assistant":
+        content = message.get("content")
+        text = (
+            "\n".join(_anchor_scene_content_visible_text(part) for part in content)
+            if isinstance(content, list) else str(content or "")
+        ).strip()
+        if text == "(empty)" and _anchor_scene_message_reasoning_text(message):
+            text = ""
+        if not text and not any((
+            message.get("tool_calls"), message.get("_partial_tool_calls"),
+            _anchor_scene_message_has_content_tool_use(message),
+            message.get("attachments"), message.get("_compressionRecovery"),
+            message.get("_statusCard"), message.get("provider_details"),
+        )):
+            return False
     return bool(role and role != "tool")
 
 
@@ -9096,6 +9111,10 @@ def _tool_result_matches_call_ids(message, call_ids) -> bool:
     return bool(tid) and str(tid) in call_ids
 
 
+_DISPLAY_WINDOW_SCAN_LIMIT = 4096
+_DISPLAY_WINDOW_ROW_LIMIT = 500
+
+
 def _message_window_for_display(messages, msg_limit=None, msg_before=None, expand_renderable=False) -> tuple[list, int]:
     """Return a paginated message window plus its offset in ``messages``.
 
@@ -9107,6 +9126,9 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
 
     ``expand_renderable`` is accepted for compatibility with older frontend
     callers. Visible-row expansion is now the default for every limited window.
+    Reasoning-only rows do not consume that budget. The search examines at most
+    4096 trailing source rows, and the contiguous result contains at most 500
+    raw rows before the existing response-byte cap. Offsets remain source indices.
     """
     _ = expand_renderable
     messages = list(messages or [])
@@ -9121,13 +9143,14 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
         return source, 0
     limit = max(1, int(msg_limit))
     end_idx = len(source)
+    scan_start = max(0, end_idx - _DISPLAY_WINDOW_SCAN_LIMIT)
     last_renderable_idx = None
-    for idx in range(end_idx - 1, -1, -1):
+    for idx in range(end_idx - 1, scan_start - 1, -1):
         if _message_counts_as_renderable_for_window(source[idx]):
             last_renderable_idx = idx
             break
     if last_renderable_idx is None:
-        start_idx = max(0, end_idx - limit)
+        start_idx = max(0, end_idx - min(limit, _DISPLAY_WINDOW_ROW_LIMIT))
         return source[start_idx:end_idx], start_idx
     # Keep the last renderable row, plus any immediately-following tool-result
     # rows whose tool_call_id matches a tool-call on a renderable row already in
@@ -9138,17 +9161,18 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
     # Orphan trailing tool-only rows (no matching call in the window) are still
     # skipped, preserving the visible-row budget. (#4070 ship-review)
     end_idx = last_renderable_idx + 1
-    window_tool_call_ids = _tool_call_ids_in_messages(source[: last_renderable_idx + 1])
+    window_start = max(scan_start, end_idx - _DISPLAY_WINDOW_ROW_LIMIT)
+    window_tool_call_ids = _tool_call_ids_in_messages(source[window_start:end_idx])
     while end_idx < len(source) and not _message_counts_as_renderable_for_window(
         source[end_idx]
-    ):
+    ) and end_idx - window_start < _DISPLAY_WINDOW_ROW_LIMIT:
         if _tool_result_matches_call_ids(source[end_idx], window_tool_call_ids):
             end_idx += 1
         else:
             break
-    start_idx = 0
+    start_idx = window_start
     renderable_count = 0
-    for idx in range(last_renderable_idx, -1, -1):
+    for idx in range(last_renderable_idx, window_start - 1, -1):
         if not _message_counts_as_renderable_for_window(source[idx]):
             continue
         renderable_count += 1
