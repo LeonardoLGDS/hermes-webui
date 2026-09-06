@@ -9160,16 +9160,11 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
     # newest assistant tool-call would leave that card without its snippet.
     # Orphan trailing tool-only rows (no matching call in the window) are still
     # skipped, preserving the visible-row budget. (#4070 ship-review)
-    end_idx = last_renderable_idx + 1
+    # WHY: prepend pagination uses one source offset for the joined array;
+    # trimming an older page's hidden suffix would silently shift newer rows.
+    if msg_before is None:
+        end_idx = last_renderable_idx + 1
     window_start = max(scan_start, end_idx - _DISPLAY_WINDOW_ROW_LIMIT)
-    window_tool_call_ids = _tool_call_ids_in_messages(source[window_start:end_idx])
-    while end_idx < len(source) and not _message_counts_as_renderable_for_window(
-        source[end_idx]
-    ) and end_idx - window_start < _DISPLAY_WINDOW_ROW_LIMIT:
-        if _tool_result_matches_call_ids(source[end_idx], window_tool_call_ids):
-            end_idx += 1
-        else:
-            break
     start_idx = window_start
     renderable_count = 0
     for idx in range(last_renderable_idx, window_start - 1, -1):
@@ -9178,6 +9173,15 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
         renderable_count += 1
         if renderable_count >= limit:
             start_idx = idx
+            break
+    # WHY: the lookback can fill 500 rows even when selection uses only 30.
+    # Charge matching results against the actual selected contiguous span,
+    # and only accept calls retained there (not calls in the unused lookback).
+    window_tool_call_ids = _tool_call_ids_in_messages(source[start_idx:end_idx])
+    while end_idx < len(source) and end_idx - start_idx < _DISPLAY_WINDOW_ROW_LIMIT:
+        if _tool_result_matches_call_ids(source[end_idx], window_tool_call_ids):
+            end_idx += 1
+        else:
             break
     window = source[start_idx:end_idx]
     return window, start_idx

@@ -63,8 +63,9 @@ def test_msg_before_anchors_page_before_trailing_tool_rows():
 
     window, offset = _message_window_for_display(messages, msg_limit=3, msg_before=14)
 
-    assert [m["role"] for m in window] == ["user", "assistant"]
-    assert [m["content"] for m in window] == ["older", "visible before tools"]
+    # WHY: even orphan hidden rows must bridge an explicit prepend boundary.
+    assert window == messages[:14]
+    assert offset + len(window) == 14
     assert offset == 0
 
 
