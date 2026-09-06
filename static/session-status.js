@@ -27,8 +27,7 @@ const _dismissedBySession = new Map();
 const _bgActiveBySession = new Map();
 const _autoDismissTimers = new Map();
 const _sessionRowsById = new Map();
-// WHY: preserve each session/group disclosure state across live stack rerenders.
-const _collapsedStatusGroups = new Map();
+// WHY: disclosure state belongs to its mounted DOM, not a session cache that outlives it.
 let _runtimeState = {};
 let _statusPollTimer = null;
 let _statusPollContext = null;
@@ -368,6 +367,9 @@ function pruneSession(session_id) {
     _autoDismissTimers.delete(sessionId);
   }
   if (_statusPollContext && str(_statusPollContext.sessionId) === sessionId) {
+    // WHY: pruning a session must release its mounted disclosure as well as its timers.
+    const stack = statusStackFor(_statusPollContext.rootEl);
+    if (stack && typeof stack.remove === 'function') stack.remove();
     _statusPollContext = null;
     stopStatusPoll();
   }
@@ -377,10 +379,6 @@ function pruneSession(session_id) {
   _bgProcsBySession.delete(sessionId);
   _dismissedBySession.delete(sessionId);
   _bgActiveBySession.delete(sessionId);
-  // WHY: deleting a session must not leak disclosure state into a reused session id.
-  for (const key of Array.from(_collapsedStatusGroups.keys())) {
-    if (key.startsWith(sessionId + '\u0000')) _collapsedStatusGroups.delete(key);
-  }
   if (window._sessionDotState) delete window._sessionDotState[sessionId];
   _recomputeSessionDotStates();
   return true;
@@ -694,15 +692,24 @@ function makeStatusElement(tagName, className, text, title) {
   return element;
 }
 
-function statusCountsText(counts) {
+function statusCountsText(counts, items) {
+  // WHY: a collapsed line must distinguish failure, waiting, and completion from live work.
   const parts = [];
   if (counts.running > 0) {
-    parts.push(counts.running + (counts.running === 1 ? ' agent' : ' agents'));
+    parts.push(counts.running + (counts.running === 1 ? ' agent running' : ' agents running'));
   }
   if (counts.bgRunning > 0) {
-    parts.push(counts.bgRunning + (counts.bgRunning === 1 ? ' job' : ' jobs'));
+    parts.push(counts.bgRunning + (counts.bgRunning === 1 ? ' job running' : ' jobs running'));
   }
-  return parts.join(' · ');
+  const states = items.subagents.map(item => item.status).concat(items.bg.map(item => item.state));
+  for (const [label, matches] of [
+    ['queued', ['queued']], ['failed', ['failed']],
+    ['interrupted', ['interrupted']], ['completed', ['completed', 'done']],
+  ]) {
+    const count = states.filter(state => matches.includes(state)).length;
+    if (count) parts.push(count + ' ' + label);
+  }
+  return 'Activity · ' + parts.join(' · ');
 }
 
 function statusStackFor(rootEl) {
@@ -728,42 +735,22 @@ function statusStackFor(rootEl) {
   return stack;
 }
 
-function appendStatusGroup(parent, sessionId, groupType, label, icon, count) {
-  // WHY: non-interactive headers left long-running status rows permanently expanded.
-  const collapseKey = sessionId + '\u0000' + groupType;
-  if (!_collapsedStatusGroups.has(collapseKey)) _collapsedStatusGroups.set(collapseKey, true);
-  const group = makeStatusElement('div', 'status-group');
-  group.dataset.groupType = groupType;
-  const header = makeStatusElement('div', 'status-group-header');
-  header.tabIndex = 0;
-  header.role = 'button';
-  header.appendChild(makeStatusElement('span', 'status-group-icon', icon));
-  header.appendChild(makeStatusElement('span', 'status-group-label', label + ' (' + count + ')'));
-  const caret = makeStatusElement('span', 'status-group-collapsed');
-  header.appendChild(caret);
-  const body = makeStatusElement('div', 'status-group-body');
-  const applyCollapsed = collapsed => {
-    _collapsedStatusGroups.set(collapseKey, collapsed);
-    group.dataset.collapsed = collapsed ? 'true' : 'false';
-    body.hidden = collapsed;
-    caret.textContent = collapsed ? '▸' : '▾';
-    if (typeof header.setAttribute === 'function') {
-      header.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-    }
-  };
-  const toggle = () => applyCollapsed(!_collapsedStatusGroups.get(collapseKey));
-  header.onclick = toggle;
-  header.onkeydown = event => {
-    if (event && (event.key === 'Enter' || event.key === ' ')) {
-      if (typeof event.preventDefault === 'function') event.preventDefault();
-      toggle();
-    }
-  };
-  group.appendChild(header);
-  group.appendChild(body);
-  parent.appendChild(group);
-  applyCollapsed(_collapsedStatusGroups.get(collapseKey) !== false);
-  return body;
+// WHY: one native disclosure replaces stacked group toggles; preserving its
+// summary node keeps keyboard focus and open state stable during polling.
+function activityBody(stack, sessionId, summaryText) {
+  if (!stack._activity || stack._activity.sessionId !== sessionId) {
+    stack.innerHTML = '';
+    const details = makeStatusElement('details', 'status-activity');
+    const summary = makeStatusElement('summary', 'status-activity-toggle');
+    const body = makeStatusElement('div', 'status-activity-body');
+    details.appendChild(summary);
+    details.appendChild(body);
+    stack.appendChild(details);
+    stack._activity = {sessionId, details, summary, body};
+  }
+  stack._activity.summary.textContent = summaryText;
+  stack._activity.body.innerHTML = '';
+  return stack._activity.body;
 }
 
 function statusGlyph(state) {
@@ -779,10 +766,22 @@ function appendSubagentRow(group, item) {
   row.dataset.itemType = 'subagent';
   row.dataset.itemState = item.status;
   row.appendChild(makeStatusElement('span', 'status-row-glyph', statusGlyph(item.status)));
+  // WHY: the combined list needs an explicit kind/state, not an unexplained glyph.
+  row.appendChild(makeStatusElement('span', 'status-row-kind', 'Agent · ' + item.status));
 
   const preview = item.goal
     || (item.stream.length ? item.stream[item.stream.length - 1].text : '');
-  const title = makeStatusElement('span', 'status-row-title', preview || 'Subagent');
+  // WHY: transport payloads are not task titles; retain the raw preview only in the tooltip.
+  let label = preview || 'Subagent';
+  if (/^\s*[\[{]/.test(label)) {
+    label = 'Subagent update';
+    try {
+      const payload = JSON.parse(preview);
+      if (typeof payload.goal === 'string') label = payload.goal;
+      else if (Array.isArray(payload.goals)) label = payload.goals.filter(goal => typeof goal === 'string').join(' · ') || label;
+    } catch (_) { /* WHY: malformed diagnostic payloads must not break live status rendering. */ }
+  }
+  const title = makeStatusElement('span', 'status-row-title', label);
   if (preview) title.title = preview;
   row.appendChild(title);
   if (item.currentTool) {
@@ -809,6 +808,8 @@ function appendBackgroundRow(group, item) {
   const row = makeStatusElement('div', 'status-row');
   row.dataset.itemType = 'background';
   row.dataset.itemState = item.state;
+  // WHY: jobs need the same readable lifecycle context as agents in the combined list.
+  row.appendChild(makeStatusElement('span', 'status-row-kind', 'Job · ' + item.state));
   const title = makeStatusElement('span', 'status-row-title', item.title || item.id);
   if (item.title) title.title = item.title;
   row.appendChild(title);
@@ -837,6 +838,9 @@ function renderStatusStack(rootEl, sessionId) {
   }
 
   const items = itemsForSession(sid);
+  // WHY: successful agent history belongs in the transcript, not permanent composer
+  // chrome. Filter only this projection; registry, failures and interrupted work survive.
+  items.subagents = items.subagents.filter(item => item.status !== 'completed');
   if (!items.subagents.length && !items.bg.length) {
     if (typeof stack.remove === 'function') stack.remove();
     _statusPollContext = null;
@@ -844,21 +848,10 @@ function renderStatusStack(rootEl, sessionId) {
     return counts;
   }
 
-  stack.innerHTML = '';
-  const summary = statusCountsText(counts);
-  if (summary) {
-    stack.appendChild(makeStatusElement('div', 'status-stack-header', summary));
-  }
-
-  if (items.subagents.length) {
-    // WHY: group labels must expose their item count like the desktop status stack.
-    const group = appendStatusGroup(stack, sid, 'subagents', 'Subagents', '◆', items.subagents.length);
-    for (const item of items.subagents) appendSubagentRow(group, item);
-  }
-  if (items.bg.length) {
-    const group = appendStatusGroup(stack, sid, 'background', 'Background jobs', '≡', items.bg.length);
-    for (const item of items.bg) appendBackgroundRow(group, item);
-  }
+  // WHY: show one outcome-aware line by default; retain all details and Open actions on demand.
+  const body = activityBody(stack, sid, statusCountsText(counts, items));
+  for (const item of items.subagents) appendSubagentRow(body, item);
+  for (const item of items.bg) appendBackgroundRow(body, item);
 
   _statusPollContext = {rootEl, sessionId: sid};
   if (_statusPollTimer !== null && !hasLiveStatusWork(sid)) stopStatusPoll();

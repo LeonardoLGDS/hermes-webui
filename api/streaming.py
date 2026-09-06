@@ -2916,21 +2916,9 @@ def _format_process_notification(evt: dict) -> str:
             return ''
     if evt.get('type') != 'completion':
         return ''
-    _sid = evt.get('session_id', '')
-    _exit = evt.get('exit_code', '')
-    if _bg_notify_mode() != 'all':
-        return (
-            f"[IMPORTANT: Background process {_sid} completed (exit code {_exit}).]"
-        )
-    _cmd = evt.get('command', '')
-    _out = evt.get('output') or ''
-    if len(_out) > 4000:
-        _out = _out[:4000] + '\n... (truncated)'
-    return (
-        f"[IMPORTANT: Background process {_sid} completed (exit code {_exit}).\n"
-        f"Command: {_cmd}\n"
-        f"Output:\n{_out}]"
-    )
+    # WHY: next-turn injection duplicated the canonical bg_task_complete card
+    # and exposed the retired raw completion protocol in chat history.
+    return ''
 
 
 def _mark_process_completion_consumed(process_registry, process_id: str) -> None:

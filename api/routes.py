@@ -13429,6 +13429,7 @@ def _assets_cache_bust_token(static_root: Path) -> str:
     # hard refresh does not bypass service worker caches.
     try:
         fingerprint = hashlib.sha256()
+        bundle_digests: list[bytes] = []
         paths = (
             sorted(static_root.glob("*.js"))
             + sorted(static_root.glob("*.css"))
@@ -13437,10 +13438,11 @@ def _assets_cache_bust_token(static_root: Path) -> str:
         for path in paths:
             if not path.exists():
                 continue
-            stat = path.stat()
-            fingerprint.update(
-                f"{path.name}:{stat.st_size}:{stat.st_mtime_ns}".encode("utf-8")
-            )
+            # WHY: metadata-preserving bundle replacement must not leave the
+            # service worker using a stale cache salt for changed live bytes.
+            bundle_digests.append(hashlib.sha256(path.read_bytes()).digest())
+        for bundle_digest in sorted(bundle_digests):
+            fingerprint.update(bundle_digest)
         return quote(f"{WEBUI_VERSION}+a{fingerprint.hexdigest()[:10]}", safe="")
     except Exception:
         return quote(WEBUI_VERSION, safe="")

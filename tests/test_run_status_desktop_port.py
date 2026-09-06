@@ -116,6 +116,104 @@ require(statusModulePath);
 """
 
 
+# WHY: exercise the real disclosure across refreshes, not just its CSS/source hooks.
+def test_activity_disclosure_retains_state_and_exposes_outcomes() -> None:
+    observed = _run_node_json(_STATUS_NODE_PRELUDE + r"""
+const api = window._sessionStatus;
+const root = makeElement('div');
+api.ingestBgStatus({processes: [
+  {id: 'live', title: 'Build', state: 'running'},
+  {id: 'bad', title: 'Tests', state: 'failed', exit_code: 1},
+]}, 'one');
+api.renderStatusStack(root, 'one');
+const stack = root.children[0];
+const details = stack.children.find(child => child.tagName === 'details');
+if (!details) { console.log(JSON.stringify({missingDisclosure: true})); }
+else {
+  const summary = details.children[0];
+  const initial = {open: Boolean(details.open), text: summary.textContent};
+  details.open = true;
+  api.renderStatusStack(root, 'one');
+  const retained = stack.children[0] === details && details.open && details.children[0] === summary;
+  api.ingestBgStatus({processes: [{id: 'done', title: 'Done', state: 'done'}]}, 'two');
+  api.renderStatusStack(root, 'two');
+  const switched = {open: Boolean(stack.children[0].open), text: stack.children[0].children[0].textContent};
+  api.renderStatusStack(root, '');
+  console.log(JSON.stringify({initial, retained, switched, removed: stack.removed,
+    absent: api.renderStatusStack(null, 'one')}));
+}
+""")
+    assert observed == {
+        'initial': {'open': False, 'text': 'Activity · 1 job running · 1 failed'},
+        'retained': True,
+        'switched': {'open': False, 'text': 'Activity · 1 completed'},
+        'removed': True,
+        'absent': {'running': 0, 'bgRunning': 1},
+    }
+
+
+# WHY: clicking a down-arrow must resume following, even with user turns present.
+def test_jump_latest_goes_directly_to_live_edge() -> None:
+    source = (REPO_ROOT / 'static' / 'jump-to-latest.js').read_text()
+    observed = _run_node_json(r"""
+globalThis.window = globalThis;
+const elements = {};
+const listeners = {};
+function element() { return {style: {}, children: [],
+  setAttribute() {}, addEventListener(name, fn) {this[name] = fn;},
+  removeEventListener() {}, appendChild(child) {this.children.push(child); elements[child.id] = child;},
+  querySelectorAll() {return [{}];}
+}; }
+const messages = elements.messages = element();
+messages.scrollHeight = 1000; messages.clientHeight = 400; messages.scrollTop = 0;
+globalThis.document = {readyState: 'complete', body: element(),
+  getElementById(id) {return elements[id] || null;}, createElement: element,
+  querySelector() {return null;}, addEventListener() {}, removeEventListener() {}};
+globalThis.addEventListener = (name, fn) => {listeners[name] = fn;};
+globalThis.requestAnimationFrame = fn => {fn(); return 1;};
+let follows = 0;
+globalThis.scrollToBottom = () => {follows++; messages.scrollTop = 600;};
+""" + source + r"""
+window._jumpToLatest.ensure();
+const button = elements.jumpLatestBtn;
+const away = !button.hidden;
+button.click();
+messages.scroll();
+const atBottom = button.hidden;
+messages.scrollHeight = 1300;
+window._jumpToLatest.ensure();
+const grew = !button.hidden;
+// WHY: normal chat's existing End cue must suppress the fallback, not compete with it.
+elements.scrollToBottomBtn = element();
+window._jumpToLatest.ensure();
+const reused = button.hidden;
+delete elements.scrollToBottomBtn;
+delete elements.messages;
+window._jumpToLatest.ensure();
+console.log(JSON.stringify({away, follows, atBottom, grew, reused, absent: button.hidden,
+  menus: document.body.children.filter(child => child.id === 'jumpLatestMenu').length,
+  buttons: document.body.children.filter(child => child.id === 'jumpLatestBtn').length}));
+""")
+    assert observed == {'away': True, 'follows': 1, 'atBottom': True, 'grew': True, 'reused': True,
+                        'absent': True, 'menus': 0, 'buttons': 1}
+
+
+# WHY: successful agent history should not leave permanent composer chrome;
+# its registry remains available for the transcript and sidebar consumers.
+def test_completed_agents_leave_no_activity_chrome() -> None:
+    observed = _run_node_json(_STATUS_NODE_PRELUDE + r"""
+const api = window._sessionStatus;
+const root = makeElement('div');
+api.ingestSubagentFrame({name: 'subagent_progress', args: {
+  subagent_id: 'finished', status: 'completed', goal: 'Finished task'
+}}, 'done');
+api.renderStatusStack(root, 'done');
+console.log(JSON.stringify({removed: root.children[0].removed === true,
+  stored: api.itemsForSession('done').subagents.length}));
+""")
+    assert observed == {'removed': True, 'stored': 1}
+
+
 def test_bg_status_payload(monkeypatch: pytest.MonkeyPatch) -> None:
     """The v2 background frame carries process rows and fails closed."""
     from api.background_process import bg_status_for_session
@@ -199,6 +297,68 @@ def test_bg_status_payload(monkeypatch: pytest.MonkeyPatch) -> None:
         "active": False,
         "processes": [],
     }
+
+
+def test_process_registration_emits_spawn_edge_bg_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly registered process is visible before any completion wakeup."""
+    from api import background_process as bp, config as cfg
+
+    sid = "session-spawn-edge"
+    rows: list[dict[str, Any]] = []
+
+    class FakeRegistry:
+        def list_sessions(self, *, session_key: str) -> list[dict[str, Any]]:
+            assert session_key == sid
+            return list(rows)
+
+        def spawn_local(self, command: str, *, session_key: str):
+            process_id = "proc-spawn-edge"
+            rows.append(
+                {
+                    "session_id": process_id,
+                    "command": command,
+                    "status": "running",
+                    "exit_code": None,
+                    "started_at": 1756800003.0,
+                }
+            )
+            return types.SimpleNamespace(id=process_id, session_key=session_key)
+
+    registry = FakeRegistry()
+    registry_module = types.ModuleType("tools.process_registry")
+    registry_module.process_registry = registry  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "tools.process_registry", registry_module)
+
+    channel = bp.get_or_create_session_channel(sid)
+    subscriber = channel.subscribe()
+    before_active_runs = dict(cfg.ACTIVE_RUNS)
+    try:
+        bp.register_process_session(sid, sid)
+        assert subscriber.get_nowait()[0] == "bg_status"
+
+        registry.spawn_local("sleep 30", session_key=sid)
+
+        event_name, payload = subscriber.get_nowait()
+        assert event_name == "bg_status"
+        assert payload["active"] is True
+        assert payload["processes"] == [
+            {
+                "id": "proc-spawn-edge",
+                "title": "sleep 30",
+                "state": "running",
+                "exit_code": None,
+                "started_at": 1756800003.0,
+            }
+        ]
+        assert subscriber.empty(), "spawn must emit exactly one bg_status frame"
+        assert cfg.ACTIVE_RUNS == before_active_runs, "spawn status must not start a turn"
+    finally:
+        channel.unsubscribe(subscriber)
+        with bp.SESSION_CHANNELS_LOCK:
+            bp.SESSION_CHANNELS.pop(sid, None)
+        bp.unregister_process_session(sid)
 
 
 def test_session_dot_state() -> None:

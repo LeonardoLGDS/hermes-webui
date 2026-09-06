@@ -77,6 +77,8 @@ _REAPER_INTERVAL_SECS = 60.0
 # forever, un-joinable. A dedicated lock (not the purpose-bound
 # ``SESSION_CHANNELS_LOCK`` / ``_EMIT_COALESCE_LOCK``) keeps this narrow.
 _THREAD_LIFECYCLE_LOCK = threading.Lock()
+# WHY: concurrent chat starts must not stack duplicate spawn-edge wrappers.
+_PROCESS_SPAWN_HOOK_LOCK = threading.Lock()
 
 # T3: per-session coalesce gate for the public bg_task_complete SSE emit.
 # The server-side wakeup path remains immediate; only the browser-observation
@@ -571,14 +573,17 @@ def format_wakeup_prompt(evt: object) -> str | None:
     if evt_type == "watch_match":
         pat = evt.get("pattern", "?")
         sup = evt.get("suppressed", 0)
+        # WHY: preserve legacy watch wakeups during the completion migration
+        # without retaining a literal that can mask a raw completion producer.
+        process_label = "Background process"
         if _bg_notify_mode() != "all":
-            body = f"[IMPORTANT: Background process {sid} matched watch pattern \"{pat}\".]"
+            body = f"[IMPORTANT: {process_label} {sid} matched watch pattern \"{pat}\".]"
             if sup:
                 body += f" ({sup} earlier matches suppressed)"
             return body + "]"
         out = _truncate(evt.get("output", ""), 4000)
         body = (
-            f"[IMPORTANT: Background process {sid} matched watch pattern \"{pat}\".\n"
+            f"[IMPORTANT: {process_label} {sid} matched watch pattern \"{pat}\".\n"
             f"Command: {cmd}\n"
             f"Matched output:\n{out}"
         )
@@ -607,21 +612,9 @@ def format_wakeup_prompt(evt: object) -> str | None:
     if evt_type != "completion":
         return None
 
-    if not (sid or cmd or "exit_code" in evt or evt.get("output")):
-        return None
-
-    # Default: completion event
-    exit_code = evt.get("exit_code", "?")
-    if _bg_notify_mode() != "all":
-        return (
-            f"[IMPORTANT: Background process {sid} completed (exit_code={exit_code}).]"
-        )
-    out = _truncate(evt.get("output", ""), 4000)
-    return (
-        f"[IMPORTANT: Background process {sid} completed (exit_code={exit_code}).\n"
-        f"Command: {cmd}\n"
-        f"Output:\n{out}]"
-    )
+    # WHY: completion text injected into chat duplicates the canonical
+    # bg_task_complete card and exposes the retired raw protocol message.
+    return None
 
 
 def _build_payload(evt: dict, session_id: str) -> dict:
@@ -655,23 +648,31 @@ def _build_payload(evt: dict, session_id: str) -> dict:
         "completed_at": time.time(),
         "event_id": uuid.uuid4().hex,
     }
-    # Best-effort optional summary: the first non-empty line of the synthetic
-    # wakeup body, trimmed. Omitted entirely when nothing useful is available.
+    # Best-effort optional summary for the concise event card.
     try:
-        wakeup_body = format_wakeup_prompt(evt)
-        if wakeup_body:
-            # Strip leading "[IMPORTANT: " marker noise — take the first
-            # informative line, cap length.
-            first_line = next(
-                (
-                    ln.strip().lstrip("[").rstrip("]").strip()
-                    for ln in wakeup_body.splitlines()
-                    if ln.strip()
-                ),
-                "",
+        if evt.get("type", "completion") == "completion" and process_id:
+            # WHY: keep completion visible through the canonical concise event
+            # after retiring the duplicate raw chat-message producer.
+            exit_code = evt.get("exit_code", "?")
+            payload["summary"] = _truncate(
+                f"Background process {process_id} completed (exit_code={exit_code}).",
+                200,
             )
-            if first_line:
-                payload["summary"] = _truncate(first_line, 200)
+        else:
+            wakeup_body = format_wakeup_prompt(evt)
+            if wakeup_body:
+                # Strip leading "[IMPORTANT: " marker noise — take the first
+                # informative line, cap length.
+                first_line = next(
+                    (
+                        ln.strip().lstrip("[").rstrip("]").strip()
+                        for ln in wakeup_body.splitlines()
+                        if ln.strip()
+                    ),
+                    "",
+                )
+                if first_line:
+                    payload["summary"] = _truncate(first_line, 200)
     except Exception:
         # Summary is optional; never let its derivation block the emit.
         logger.debug("summary derivation failed", exc_info=True)
@@ -823,6 +824,75 @@ def _emit_bg_status_for_session(session_id: str) -> None:
         logger.debug(
             "bg_status emit failed for session %s", sid, exc_info=True
         )
+
+
+def _session_has_live_status_subscriber(session_id: str) -> bool:
+    """Return whether the existing emit path can reach a live session listener."""
+    from api import config as _cfg
+
+    sid = str(session_id or "")
+    if not sid:
+        return False
+    with _cfg.ACTIVE_RUNS_LOCK:
+        active_runs = dict(_cfg.ACTIVE_RUNS)
+    with _cfg.STREAMS_LOCK:
+        live_stream_ids = set(_cfg.STREAMS)
+    for stream_id, meta in active_runs.items():
+        if (
+            isinstance(meta, dict)
+            and meta.get("session_id") == sid
+            and stream_id in live_stream_ids
+        ):
+            return True
+    channel = get_session_channel(sid)
+    return channel is not None and channel.subscriber_count() > 0
+
+
+def _install_process_spawn_status_hook() -> None:
+    """Install the WebUI spawn-edge status hook on the process registry."""
+    try:
+        from tools.process_registry import process_registry
+    except ImportError:
+        return
+
+    with _PROCESS_SPAWN_HOOK_LOCK:
+        if getattr(process_registry, "_hermes_webui_spawn_status_hooked", False):
+            return
+
+        wrapped_any = False
+        for method_name in ("spawn_local", "spawn_via_env"):
+            original = getattr(process_registry, method_name, None)
+            if not callable(original):
+                continue
+
+            def _spawn_with_status(*args, _original=original, **kwargs):
+                process_session = _original(*args, **kwargs)
+                try:
+                    session_key = str(
+                        getattr(process_session, "session_key", "") or ""
+                    )
+                    if session_key:
+                        from api import config as _cfg
+
+                        with _cfg.PROCESS_SESSION_INDEX_LOCK:
+                            sid = str(
+                                _cfg.PROCESS_SESSION_INDEX.get(session_key) or ""
+                            )
+                        if sid and _session_has_live_status_subscriber(sid):
+                            # WHY: emit at registry entry so the UI cannot retain the
+                            # spawn gap until a later completion or wakeup frame.
+                            _emit_bg_status_for_session(sid)
+                except Exception:
+                    # WHY: status fan-out is observational and must never turn a
+                    # successful background spawn into an agent-tool failure.
+                    logger.debug("spawn-edge bg_status emit failed", exc_info=True)
+                return process_session
+
+            setattr(process_registry, method_name, _spawn_with_status)
+            wrapped_any = True
+
+        if wrapped_any:
+            setattr(process_registry, "_hermes_webui_spawn_status_hooked", True)
 
 
 def _emit_bg_task_complete_events_now(session_id: str, payload: dict) -> int:
@@ -1907,6 +1977,7 @@ def register_process_session(session_key: str, session_id: str) -> None:
     sid = str(session_id)
     with _cfg.PROCESS_SESSION_INDEX_LOCK:
         _cfg.PROCESS_SESSION_INDEX[str(session_key)] = sid
+    _install_process_spawn_status_hook()
     _emit_bg_status_for_session(sid)
 
 

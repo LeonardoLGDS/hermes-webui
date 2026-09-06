@@ -7381,87 +7381,60 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
   line-height:1.25;
   white-space:normal;
 }
-/* WHY: desktop-parity jump-to-latest control (scroll-to-bottom-button.tsx). */
+/* WHY: only partial pages need this fallback; normal chat reuses its End cue. */
 .jump-latest-pill{
   position:fixed;
   right:1.25rem;
   bottom:calc(1rem + var(--composer-measured-height,6.5rem));
   z-index:60;
-  width:2rem;height:2rem;
+  min-width:44px;min-height:44px;
+  padding:0 12px;
   border-radius:9999px;
-  border:1px solid rgba(120,120,140,.35);
-  background:rgba(250,250,252,.92);
-  color:#555;
-  display:grid;place-items:center;
-  font-size:1.05rem;line-height:1;
+  border:1px solid var(--border);
+  background:var(--surface);
+  color:var(--text);
+  font:inherit;
   cursor:pointer;
-  box-shadow:0 4px 14px rgba(0,0,0,.12);
-  backdrop-filter:blur(.75rem);
-  transition:opacity .18s ease,transform .18s ease;
 }
-.jump-latest-pill:hover{color:#111;transform:translateY(-1px);}
 .jump-latest-pill[hidden]{display:none;}
-.jump-latest-menu{
-  position:fixed;
-  right:1.25rem;
-  bottom:calc(3.5rem + var(--composer-measured-height,6.5rem));
-  z-index:60;
-  width:min(24rem,86vw);
-  max-height:60vh;overflow-y:auto;
-  border-radius:.75rem;
-  border:1px solid rgba(120,120,140,.35);
-  background:rgba(250,250,252,.97);
-  box-shadow:0 10px 30px rgba(0,0,0,.18);
-  backdrop-filter:blur(.75rem);
-  padding:.35rem;
-}
-.jump-latest-item{
-  display:flex;align-items:center;gap:.5rem;
-  width:100%;
-  padding:.4rem .55rem;
-  border-radius:.5rem;
-  border:0;background:transparent;
-  text-align:left;cursor:pointer;
-  color:inherit;font:inherit;font-size:.85rem;
-}
-.jump-latest-item:hover{background:rgba(0,0,0,.06);}
-.jump-latest-title{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-.jump-latest-time{flex:none;font-size:.72rem;color:rgba(90,90,110,.75);}
-.jump-latest-item.is-latest .jump-latest-title{font-weight:650;}
-.jump-latest-item.is-latest{background:rgba(80,120,255,.10);}
-.jump-flash{animation:jumpFlash 1.2s ease-out;}
-@keyframes jumpFlash{from{background:rgba(80,120,255,.28);}to{background:transparent;}}
-.status-stack-header{
+/* WHY: a single native summary is keyboard-accessible and hides diagnostic rows
+   without hiding failures in the outcome text or adding nested disclosures. */
+.status-activity-toggle{
+  min-height:32px;
+  padding:6px 0;
+  box-sizing:border-box;
   color:var(--muted);
-  font-size:.58rem;
-  font-variant-numeric:tabular-nums;
-  line-height:1.2;
+  font-size:.75rem;
+  line-height:1.4;
+  cursor:pointer;
+  overflow-wrap:anywhere;
 }
-.status-group{
-  margin-top:4px;
-  max-height:72px;
+.status-activity-toggle:focus-visible,.jump-latest-pill:focus-visible{
+  outline:2px solid var(--accent);
+  outline-offset:2px;
+}
+.status-activity-body{
+  max-height:min(28vh,180px);
   overflow-y:auto;
   overscroll-behavior:contain;
 }
-.status-group-header{
-  display:flex;
-  align-items:center;
-  gap:4px;
-  min-width:0;
-  color:var(--muted);
-  font-size:.58rem;
-  font-weight:600;
-  line-height:1.2;
+.status-row-kind{flex:0 0 auto;color:var(--muted);}
+/* WHY: touch users need real targets, while narrow rows must retain their titles. */
+@media(max-width:640px){
+  .status-activity-toggle{min-height:44px;padding:12px 0;}
+  .status-row{flex-wrap:wrap;}
+  .status-row-tool{display:none;}
+  .status-row-action{min-height:44px;min-width:44px;justify-content:center;}
 }
-.status-group-icon,.status-group-collapsed{flex:0 0 auto;line-height:1;}
-.status-group-label{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .status-row{
+  /* WHY: expanded details must be readable rather than screenshot-sized microtext. */
   display:flex;
   align-items:center;
   gap:6px;
   min-width:0;
   color:var(--text);
-  font-size:.62rem;
+  font-size:.75rem;
+  min-height:28px;
   line-height:1.2;
 }
 .status-row-glyph{
@@ -7504,6 +7477,7 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
   line-height:1.2;
 }
 .status-row-action{
+  /* WHY: make the preserved child-session action readable and focusable at row size. */
   display:inline-flex;
   align-items:center;
   flex:0 0 auto;
@@ -7512,7 +7486,7 @@ html[data-conversation-outline="enabled"] #outlineToggleBtn:not([hidden]){displa
   background:none;
   color:var(--accent-text);
   font-family:var(--font-ui);
-  font-size:.58rem;
+  font-size:inherit;
   line-height:1.2;
   cursor:pointer;
   opacity:.72;

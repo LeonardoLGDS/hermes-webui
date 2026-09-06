@@ -8156,6 +8156,8 @@ function _renderComposerStatusStack(el){
     if(!statusApi || typeof statusApi.renderStatusStack!=='function') return;
     const sid=S && S.session && S.session.session_id;
     if(!sid){
+      // WHY: switching to an empty chat must remove the previous session's disclosure.
+      statusApi.renderStatusStack(el,'');
       _stopComposerStatusPoll();
       return;
     }
@@ -8181,6 +8183,9 @@ function setComposerStatus(t,timeoutMs){
   if(!el)return;
   const statusHidden=!!(window._composerControlVisibility&&window._composerControlVisibility.hide_composer_status);
   if(statusHidden){
+    // WHY: hiding composer status must also hide the separate activity dock.
+    const dock=document.getElementById('composerStatusDock');
+    if(dock) dock.style.display='none';
     el.style.display='none';
     el.textContent='';
     _stopComposerStatusPoll();
@@ -18825,8 +18830,8 @@ function buildToolCard(tc){
   const moreLabel=tc.is_diff?'Show diff':'Show more';
   const lessLabel=tc.is_diff?'Hide diff':'Show less';
   const runIndicator=tc.done===false?'<span class="tool-card-running-dot"></span>':'';
-  const isSubagent=tc.name==='subagent_progress';
-  const isDelegation=tc.name==='delegate_task';
+  // WHY: delegate_task spawn rows must use the enriched subagent card instead of silently falling back to a generic tool card.
+  const isSubagent=tc.name==='subagent_progress'||tc.name==='delegate_task';
   const openClass='';
   const cardClass='tool-card'+(tc.done===false?' tool-card-running':'')+(isSubagent?' tool-card-subagent':'')+(hasDetail?'':' tool-card-no-detail')+openClass;
   const headerClick=hasDetail?' onclick="this.closest(\'.tool-card\').classList.toggle(\'open\')"':'';
@@ -18868,7 +18873,8 @@ function buildToolCard(tc){
       catch(_){ subagentTool=rawTool; }
     }
   }
-  const subagentProgress=(isSubagent&&tc.done===false&&typeof tc.preview==='string')?tc.preview.trim():'';
+  // WHY: terminal bg_task_complete edges must update the progress span with their final output instead of deleting it during settlement.
+  const subagentProgress=(isSubagent&&typeof tc.preview==='string')?tc.preview.trim():'';
   const subagentInfoParts=[];
   if(subagentGoal) subagentInfoParts.push(`<span class="tool-card-subagent-goal">${esc(subagentGoal)}</span>`);
   if(subagentStatus) subagentInfoParts.push(`<span class="tool-card-subagent-status">${esc(subagentStatus)}</span>`);
@@ -18900,6 +18906,11 @@ function buildToolCard(tc){
       ${subagentInfoParts.length?`<div class="tool-card-subagent-info">${subagentInfoParts.join('')}</div>`:''}
     </div>`;
   row._tcData = tc;
+  if(isSubagent&&tc.args){
+    // WHY: bg_status/bg_task_complete need a durable task identity to patch the matching message-log card idempotently.
+    const runStatusId=tc.args.subagent_id||tc.args.delegation_id||tc.args.task_id||tc.args.process_id||'';
+    if(runStatusId) row.dataset.runStatusId=String(runStatusId);
+  }
   // Durable classification flags: _tcData (a JS property) does NOT survive the
   // outerHTML/innerHTML snapshot+restore the live tool-call group uses on session
   // switch/restore, which would make _syncToolCallGroupSummary re-count restored
@@ -18909,6 +18920,46 @@ function buildToolCard(tc){
   else if(_isSkillUpdate(tc)){row.setAttribute('data-skill-update','1');row.removeAttribute('data-memory-save');}
   else {row.removeAttribute('data-memory-save');row.removeAttribute('data-skill-update');}
   return row;
+}
+
+function syncBackgroundToolRunCards(items,sessionId){
+  // WHY: standalone background edges must update or create their message-log card instead of changing only the composer registry.
+  try{
+    const sid=String(sessionId||'');
+    if(!sid||!Array.isArray(items)||!S||!S.session||S.session.session_id!==sid) return;
+    const root=$('msgInner');
+    if(!root||typeof buildToolCard!=='function') return;
+    for(const item of items){
+      const runId=String(item&&item.id||'');
+      if(!runId) continue;
+      const state=String(item.state||'failed');
+      const status=state==='running'?'running':(state==='done'?'completed':'failed');
+      const progress=String(item.output||'').trim()||(status==='running'?'Running in background':'');
+      const toolCall={
+        name:'delegate_task',
+        tid:runId,
+        done:status!=='running',
+        is_error:status==='failed',
+        args:{task_id:runId,goal:String(item.title||runId),status},
+        preview:progress,
+      };
+      const selector=`.tool-card-row[data-run-status-id="${CSS.escape(runId)}"]`;
+      let existing=root.querySelector(selector);
+      if(!existing&&S.activeStreamId&&typeof appendLiveToolCard==='function'){
+        appendLiveToolCard(toolCall,{sessionId:sid,streamId:S.activeStreamId});
+        existing=root.querySelector(selector);
+        if(existing) continue;
+      }
+      const row=buildToolCard(toolCall);
+      row.dataset.backgroundRun='1';
+      if(existing){
+        // WHY: replacing a live background card must preserve its stream identity so later tool completion remains idempotent.
+        if(existing.dataset.liveTid) row.dataset.liveTid=existing.dataset.liveTid;
+        existing.replaceWith(row);
+      }
+      else root.appendChild(row);
+    }
+  }catch(_){ }
 }
 
 function _colorDiffLines(text){

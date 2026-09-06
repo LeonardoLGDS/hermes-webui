@@ -8214,7 +8214,19 @@ function startSessionStream(sid) {
             runs: Math.max(0, Number(d.runs) || 0),
           });
         }
-        window._sessionStatus && window._sessionStatus.ingestBgStatus(d, evSid);
+        const statusApi=window._sessionStatus;
+        if(statusApi){
+          statusApi.ingestBgStatus(d, evSid);
+          // WHY: a lone bg_status edge must repaint the open composer stack immediately instead of waiting for a later status edge.
+          const statusRoot=document.getElementById('composerStatusDock')||document.getElementById('composerStatus');
+          if(statusRoot&&S&&S.session&&S.session.session_id===evSid&&typeof statusApi.renderStatusStack==='function'){
+            statusApi.renderStatusStack(statusRoot,evSid);
+          }
+          // WHY: bg_status must create/update the task-ID-keyed message card, not leave progress visible only in the composer registry.
+          if(typeof syncBackgroundToolRunCards==='function'&&typeof statusApi.itemsForSession==='function'){
+            syncBackgroundToolRunCards(statusApi.itemsForSession(evSid).bg,evSid);
+          }
+        }
       } catch (_) {}
     });
     // ── Visible-tab self-heal: a server-initiated turn finished during an SSE
@@ -8418,10 +8430,22 @@ function _handleBgTaskCompleteEvent(e, expectedSid, opts) {
       }).catch(() => {});
     } catch(_) {}
 
-    window._sessionStatus && window._sessionStatus.ingestBgTaskComplete({
-      ...d,
-      session_id: sid,
-    });
+    const statusApi=window._sessionStatus;
+    if(statusApi){
+      const completedItem=statusApi.ingestBgTaskComplete({
+        ...d,
+        session_id: sid,
+      });
+      // WHY: a terminal background edge must repaint the open composer stack immediately so running state does not linger.
+      const statusRoot=document.getElementById('composerStatusDock')||document.getElementById('composerStatus');
+      if(statusRoot&&S&&S.session&&S.session.session_id===sid&&typeof statusApi.renderStatusStack==='function'){
+        statusApi.renderStatusStack(statusRoot,sid);
+      }
+      // WHY: bg_task_complete must settle the matching message-log status spans instead of updating only the composer registry.
+      if(completedItem&&typeof syncBackgroundToolRunCards==='function'){
+        syncBackgroundToolRunCards([completedItem],sid);
+      }
+    }
 
     // Option Z PIVOT: the browser NO LONGER re-POSTs the chat-start endpoint
     // to wake the agent. Server-side wakeup is the PRIMARY mechanism — the
