@@ -100,3 +100,27 @@ def test_matching_tool_tail_preserves_byte_refusal_and_suffix():
     assert bounded_offset > offset
     with pytest.raises(WindowTooLarge):
         bounded_window(page, offset, budget=100)
+
+
+@pytest.mark.parametrize("anchor", [
+    {"role": "assistant", "content": "reply", "_partial_tool_calls": [{"tool_call_id": "call"}]},
+    {"role": "assistant", "content": [{"type": "tool_use", "id": "call", "name": "test", "input": {}}]},
+])
+def test_long_prefix_retains_supported_call_shapes(anchor):
+    messages = [{"role": "user", "content": "prefix"} for index in range(499)] + [
+        anchor, {"role": "tool", "tool_use_id": "call", "content": "result"},
+    ]
+    page, offset = _message_window_for_display(messages, msg_limit=30)
+    assert offset == 470
+    assert page == messages[470:]
+
+
+def test_initial_tool_tail_does_not_jump_over_orphan():
+    messages = [{"role": "user", "content": "prefix"} for index in range(499)] + [
+        {"role": "assistant", "content": "", "tool_calls": [{"id": "call"}]},
+        {"role": "tool", "tool_call_id": "orphan", "content": "orphan"},
+        {"role": "tool", "tool_call_id": "call", "content": "result"},
+    ]
+    page, offset = _message_window_for_display(messages, msg_limit=30)
+    assert page == messages[offset:500]
+    assert offset == 470

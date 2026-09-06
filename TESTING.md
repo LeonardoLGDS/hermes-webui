@@ -2012,8 +2012,18 @@ raw rows, and retain the existing 1.5 MiB message-payload ceiling. Date separato
 follow rendered reply/media/status content, not hidden reasoning anchors. These
 are display-only rules; persisted transcripts and model context are unchanged.
 
+Explicit `msg_before` pages retain their raw right boundary, including hidden
+reasoning and orphan tool suffixes: prepending a page must leave every browser
+local index plus `_oldestIdx` equal to its original source index. Only an initial
+latest window may omit a hidden suffix. Byte trimming removes a prefix and moves
+the offset, so subsequent older requests still meet the same boundary. Matching
+trailing tool results consume capacity from the selected window, not the unused
+500-row lookback; the hard row and byte caps still take priority.
+
 Run `./scripts/test.sh -q tests/test_reasoning_tail_display.py
-tests/test_session_message_window_renderable_tail.py` for window/cursor regressions.
+tests/test_session_message_window_renderable_tail.py
+tests/test_display_r2_regressions.py` for window/cursor regressions, including
+multi-page source identity, byte-trimmed joins, scan gaps, and tool-tail caps.
 An optional `DISPLAY_SESSION_FIXTURE` points to the private incident fixture outside
 Git; failures must not dump its message contents.
 
@@ -2025,6 +2035,12 @@ control. Playwright and Chromium are prerequisites. Screenshots contain private
 conversation text: keep the artifact directory outside Git and do not publish it.
 `--controlled-checks` additionally verifies hidden-tail dates and active-stream
 field preservation in browser memory; it is not a live-run proof.
+With a fixture, each navigation checks the browser's source coordinates against
+the original rows (allowing the existing tool-preview projection). `--gap-checks`
+also creates a separate synthetic sidecar only in the isolated server's temporary
+state, then uses real GETs and `_loadOlderMessages` through multiple hidden gaps
+and the 500-row frontend ceiling. It verifies all loaded row identities and DOM
+local-index targets; it does not perform destructive edit/regenerate requests.
 
 For an authorized, read-only deployed check, pass `--base-url ORIGIN --session-id ID
 --artifacts DIRECTORY` instead. If needed, `--auth-env VARIABLE_NAME` reads an

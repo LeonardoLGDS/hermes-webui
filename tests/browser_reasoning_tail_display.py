@@ -8,9 +8,39 @@ from pathlib import Path
 import shutil
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from browser_conversation_lifecycle import _start_webui_server, _terminate_process
+
+
+def source_coordinates(page, messages):
+    # WHY: cursor movement alone cannot detect a hidden gap shifting edit targets.
+    # Compare browser-owned rows and DOM local indices to the original sidecar.
+    # WHY: tool content is preview-clipped and may be secret-redacted by GETs;
+    # its call ID/name/timestamp identify it instead. Editable reply content
+    # must match exactly. Synthetic rows additionally have unique source IDs.
+    return page.evaluate("""source => {
+        const same = (row, original) => !!original && row.role === original.role &&
+            (row.id || null) === (original.id || null) &&
+            (row.timestamp || row._ts || null) === (original.timestamp || original._ts || null) &&
+            (row.role === 'tool' ? row.tool_call_id === original.tool_call_id &&
+                row.tool_name === original.tool_name && row.name === original.name :
+                JSON.stringify(row.content) === JSON.stringify(original.content));
+        const rows = S.messages || [];
+        const nodes = [...document.querySelectorAll('[data-msg-idx]')];
+        return {offset: _oldestIdx, rows: rows.length, indexedNodes: nodes.length,
+            rowMismatches: rows.flatMap((row, index) => same(row, source[_oldestIdx + index]) ? [] : [{index,
+                role: row.role === source[_oldestIdx + index]?.role,
+                content: JSON.stringify(row.content) === JSON.stringify(source[_oldestIdx + index]?.content),
+                id: (row.id || null) === (source[_oldestIdx + index]?.id || null)}]),
+            invalidNodeIndices: nodes.map(node => Number(node.dataset.msgIdx)).filter(index => !rows[index]),
+            valid: rows.every((row, index) => same(row, source[_oldestIdx + index])) &&
+                nodes.every(node => {
+                    const index = Number(node.dataset.msgIdx);
+                    return Number.isInteger(index) && !!rows[index] &&
+                        same(rows[index], source[_oldestIdx + index]);
+                })};
+    }""", messages)
 
 
 def main():
@@ -21,6 +51,7 @@ def main():
     parser.add_argument("--artifacts", type=Path, required=True)
     parser.add_argument("--expect-blank", action="store_true")
     parser.add_argument("--controlled-checks", action="store_true", help="Also exercise hidden-tail and active-run browser-memory invariants")
+    parser.add_argument("--gap-checks", action="store_true", help="Also page a separate synthetic sidecar through real GET/rendering")
     parser.add_argument("--auth-env", help="Environment variable holding an existing Cookie header; never saved")
     args = parser.parse_args()
     from playwright.sync_api import sync_playwright
@@ -39,6 +70,22 @@ def main():
                 (root / "hermes" / "active_profile").write_text("main\n")
                 (state / "sessions").mkdir(parents=True)
                 shutil.copyfile(args.fixture, state / "sessions" / f"{args.session_id}.json")
+                if args.gap_checks:
+                    # WHY: a separate synthetic session forces ceiling pagination
+                    # across several gaps without modifying the immutable fixture.
+                    gap_rows = []
+                    for block in range(3):
+                        gap_rows.extend({"role": "user", "content": "R2 reply"} for index in range(35))
+                        gap_rows.extend({"role": "assistant", "content": "", "reasoning": "hidden"} for index in range(40))
+                    gap_rows.extend({"role": "assistant" if index % 2 else "user", "content": "R2 reply"} for index in range(500))
+                    for index, row in enumerate(gap_rows):
+                        row["id"] = f"r2-source-{index}"
+                        row["timestamp"] = 1_700_000_000 + index
+                        if row["content"]:
+                            row["content"] = f"R2 source row {index}"
+                    gap_session = {"session_id": "display-r2-gap", "title": "R2 synthetic gaps", "profile": "main",
+                                   "messages": gap_rows, "context_messages": gap_rows}
+                    (state / "sessions" / "display-r2-gap.json").write_text(json.dumps(gap_session))
                 agent = root / "no-agent"
                 agent.mkdir()
                 (agent / "run_agent.py").write_text('"""No model runtime in display gate."""\n')
@@ -103,6 +150,7 @@ def main():
                                     "total": payload.get("message_count"),
                                     "end": (payload.get("_messages_offset") or 0) + len(payload.get("messages", [])),
                                     "active": bool(payload.get("active_stream_id")),
+                                    "before": parse_qs(urlsplit(response.url).query).get("msg_before", [None])[0],
                                 })
 
                     page.on("response", response_seen)
@@ -125,6 +173,10 @@ def main():
                             active: !!(S.session && S.session.active_stream_id)
                         })""")
                         results.append({"viewport": label, "stage": stage, **stats})
+                        if args.fixture:
+                            identity = source_coordinates(page, json.loads(args.fixture.read_bytes())["messages"])
+                            assert identity["valid"], f"Original fixture source-coordinate mismatch: {identity}"
+                            results.append({"viewport": label, "stage": stage, "source_coordinates": identity})
                         page.screenshot(path=str(args.artifacts / f"{label}-{stage}.png"))
                         if args.expect_blank:
                             assert stats["user"] + stats["assistant"] == 0
@@ -187,7 +239,32 @@ def main():
                     assert session_responses and len(session_responses) <= 16
                     assert all(item["rows"] <= 500 and item["bytes"] <= 2_000_000 for item in session_responses)
                     assert sum(item["bytes"] for item in session_responses) <= 16 * 2_000_000
-                    results.append({"viewport": label, "requests": session_responses, "errors": errors, "failed_sessions": failures, "blocked": blocked})
+                    results.append({"viewport": label, "requests": list(session_responses), "errors": errors, "failed_sessions": failures, "blocked": blocked})
+                    if args.gap_checks:
+                        assert not args.base_url, "synthetic checks are isolated-server only"
+                        gap_start = len(session_responses)
+                        page.evaluate("() => loadSession('display-r2-gap')")
+                        page.wait_for_function("() => S.session?.session_id === 'display-r2-gap' && S.messages.length > 0")
+                        gap_metrics = []
+                        for attempt in range(30):
+                            identity = source_coordinates(page, gap_rows)
+                            assert identity["valid"] and identity["indexedNodes"] > 0, f"Synthetic source-coordinate mismatch: {identity}"
+                            gap_metrics.append(identity)
+                            if identity["offset"] == 0:
+                                break
+                            page.evaluate("() => _loadOlderMessages()")
+                            assert page.evaluate("() => _oldestIdx") < identity["offset"], "Synthetic cursor stalled"
+                        assert gap_metrics[-1]["offset"] == 0
+                        assert gap_metrics[-1]["rows"] == len(gap_rows)
+                        assert sum(item["rows"] > 500 for item in gap_metrics) >= 2
+                        page.screenshot(path=str(args.artifacts / f"{label}-gap-joined.png"))
+                        results.append({"viewport": label, "synthetic_gap_joins": gap_metrics})
+                        gap_requests = session_responses[gap_start:]
+                        assert len(gap_requests) <= 40
+                        assert sum(item["before"] is not None for item in gap_requests) >= 2
+                        assert all(item["rows"] <= 500 and item["bytes"] <= 2_000_000 for item in gap_requests)
+                        results.append({"viewport": label, "synthetic_gap_requests": gap_requests})
+                        assert not errors and not failures
                     context.close()
                 browser.close()
             (args.artifacts / "metrics.json").write_text(json.dumps(results, indent=2))
@@ -203,6 +280,10 @@ def main():
                     candidate = json.loads((state / "sessions" / f"{args.session_id}.json").read_bytes())
                     for key in ("messages", "context_messages", "active_stream_id"):
                         assert bool(candidate.get(key) == original.get(key)), f"Candidate changed {key}"
+                    if args.gap_checks:
+                        saved_gap = json.loads((state / "sessions" / "display-r2-gap.json").read_bytes())
+                        assert saved_gap["messages"] == gap_rows
+                        assert saved_gap["context_messages"] == gap_rows
 
 
 if __name__ == "__main__":

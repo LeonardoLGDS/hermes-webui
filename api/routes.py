@@ -9158,8 +9158,8 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
     # S.toolCalls path) from role:"tool" rows indexed by tool_call_id
     # (static/ui.js resultsByTid), so dropping the result row that follows the
     # newest assistant tool-call would leave that card without its snippet.
-    # Orphan trailing tool-only rows (no matching call in the window) are still
-    # skipped, preserving the visible-row budget. (#4070 ship-review)
+    # Initial windows skip orphan trailing tool-only rows (no matching call
+    # in the window), preserving the visible-row budget. (#4070 ship-review)
     # WHY: prepend pagination uses one source offset for the joined array;
     # trimming an older page's hidden suffix would silently shift newer rows.
     if msg_before is None:
