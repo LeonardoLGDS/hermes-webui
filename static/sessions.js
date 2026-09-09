@@ -3176,7 +3176,8 @@ async function _ensureMessagesLoaded(sid, opts) {
   try {
     data = await api(
       `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0${reloadLimitParam}${expandParam}`,
-      {timeoutMs:120000}
+      // WHY: Retry transient admission/gateway failures with api()'s bounded backoff before showing the failure pill.
+      {timeoutMs:120000, retryStatuses:[429,502,503,504], retryDelayMs:500}
     );
   } finally {
     if (_ownsLoad()) _clearSameSessionForceReloadHint(sid);

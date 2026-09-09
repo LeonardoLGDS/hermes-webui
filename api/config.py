@@ -8322,6 +8322,31 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
     elif force_refresh:
         stale_disk_groups = _load_stale_models_cache_from_disk()
 
+    # WHY (R93): a prefer_cache caller must never block on the cache lock,
+    # not even for a sample-False window — the rebuild foreground owns the
+    # RLock for its entire build_done.wait(budget), and any `with`/acquire
+    # behind that window blocks before any in-lock guard could run (R92
+    # BLOCKED on exactly this). Try-acquire: if free, run the same reads
+    # under the lock (the fresh-memory helper mutates fingerprint/provenance
+    # state, so it must stay inside its synchronization boundary — R90);
+    # if busy, serve stale/minimal immediately. The guard is unconditional
+    # for prefer_cache; NON-prefer callers are completely untouched and
+    # still flow into the original `with` block below.
+    if prefer_cache:
+        if _available_models_cache_lock.acquire(blocking=False):
+            try:
+                cached = _get_fresh_memory_models_cache(time.monotonic())
+                if cached is not None:
+                    return cached
+                if stale_disk_groups is not None:
+                    return copy.deepcopy(stale_disk_groups)
+                return copy.deepcopy(_minimal_static_models_catalog())
+            finally:
+                _available_models_cache_lock.release()
+        else:
+            if stale_disk_groups is not None:
+                return copy.deepcopy(stale_disk_groups)
+            return copy.deepcopy(_minimal_static_models_catalog())
     with _available_models_cache_lock:
         # If another thread is already building, wait for its result instead
         # of re-entering the cold path (avoids duplicate 10s zai load_pool calls).

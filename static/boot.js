@@ -3275,7 +3275,41 @@ function _mirrorSpeechSettingsFromServer(s){
 }
 window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
 
+function _normalizeApprovalCardPlacement(){
+  const composer=document.getElementById('composerWrap');
+  const flyout=composer&&composer.querySelector(':scope > .composer-flyout');
+  if(!flyout) return null;
+  const cards=Array.from(document.querySelectorAll('#approvalCard'));
+  if(!cards.length) return null;
+  const canonical=cards.find(card=>card.parentElement===flyout)||cards[0];
+  // WHY: an extension or stale render can re-parent/duplicate the approval card
+  // into `.messages`, causing the scroll-following symptom instead of remaining
+  // docked above the composer. Keep one existing canonical node and discard only
+  // stale approval-card duplicates; never touch unrelated message nodes.
+  if(canonical.parentElement!==flyout) flyout.appendChild(canonical);
+  cards.forEach(card=>{ if(card!==canonical) card.remove(); });
+  return canonical;
+}
+window._normalizeApprovalCardPlacement=_normalizeApprovalCardPlacement;
+
 (async()=>{
+  const approvalCard=_normalizeApprovalCardPlacement();
+  if(approvalCard){
+    approvalCard.addEventListener('click',event=>{
+      const button=event.target instanceof Element
+        ? event.target.closest('[data-approval-choice]')
+        : null;
+      if(!button||!approvalCard.contains(button)||button.disabled)return;
+      const choice=button.getAttribute('data-approval-choice');
+      if(choice!=='once'&&choice!=='session'&&choice!=='always'&&choice!=='deny')return;
+      // Capture prevents the legacy inline target handler from also invoking the
+      // responder, while the inline handlers remain as a fallback if this boot
+      // listener is absent. The responder's owner check is the final dedupe.
+      event.preventDefault();
+      event.stopPropagation();
+      if(typeof respondApproval==='function')respondApproval(choice);
+    },true);
+  }
   // Load send key preference
   let _bootSettings={};
   const prefillIntent=(typeof _composerPrefillIntentFromLocation==='function')?_composerPrefillIntentFromLocation():null;

@@ -1,0 +1,17 @@
+============================= test session starts ==============================
+platform linux -- Python 3.11.16, pytest-9.1.1, pluggy-1.6.0 -- /home/ops/hermes-webui-src/.venv/bin/python
+cachedir: .pytest_cache
+rootdir: /home/ops
+plugins: shard-0.1.2, anyio-4.14.2, asyncio-1.4.0, timeout-2.4.0
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 6 items
+Running 6 items in this shard: workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_bounded_initial_open_returns_200_with_tail_and_ui_shape, workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_plain_open_of_same_large_fixture_hits_full_memory_gate, workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_msg_before_payload_joins_contiguously_before_initial_tail, workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_msg_before_route_open_returns_older_window, workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_oversized_msg_limit_stays_on_full_path_and_hits_gate, workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_absent_messages_stays_on_full_path_and_hits_gate
+
+../workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_bounded_initial_open_returns_200_with_tail_and_ui_shape PASSED [ 16%]
+../workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_plain_open_of_same_large_fixture_hits_full_memory_gate PASSED [ 33%]
+../workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_msg_before_payload_joins_contiguously_before_initial_tail PASSED [ 50%]
+../workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_msg_before_route_open_returns_older_window XFAIL [ 66%]
+../workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_oversized_msg_limit_stays_on_full_path_and_hits_gate PASSED [ 83%]
+../workspace/webui-bounded-open-r72/tests/test_r72_bounded_initial_open.py::test_absent_messages_stays_on_full_path_and_hits_gate XFAIL [100%]
+
+========================= 4 passed, 2 xfailed in 0.82s =========================
