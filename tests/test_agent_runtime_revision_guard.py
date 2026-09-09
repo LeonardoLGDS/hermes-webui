@@ -232,48 +232,47 @@ def test_revision_identity_comes_from_loaded_agent_module(monkeypatch, tmp_path:
     assert agent_runtime._AGENT_REVISION == _git(loaded_dir, "rev-parse", "HEAD")
 
 
-def test_git_identity_loss_uses_module_mtime_when_revision_becomes_unreadable(
+def test_git_identity_loss_rejects_changed_source_with_preserved_metadata(
     monkeypatch, tmp_path: Path
 ):
-    """Losing Git metadata alone must not block an unchanged loaded module."""
+    """A known Git identity cannot fall back to forgeable file metadata."""
     from api import agent_runtime
 
     source_dir = tmp_path / "loaded-agent"
     source_dir.mkdir()
     module_file = source_dir / "run_agent.py"
-    module_file.write_text("class AIAgent: pass\n", encoding="utf-8")
+    module_file.write_bytes(b"class AIAgent: pass\n")
+    _git(source_dir, "init", "-q")
+    _git(source_dir, "add", "run_agent.py")
+    _git(source_dir, "commit", "-qm", "loaded agent")
 
     loaded_module = types.ModuleType("run_agent")
     loaded_module.__file__ = str(module_file)
     monkeypatch.setitem(sys.modules, "run_agent", loaded_module)
-    monkeypatch.setattr(agent_runtime, "_AGENT_SOURCE_DIR", None)
-    monkeypatch.setattr(agent_runtime, "_AGENT_MODULE_PATH", None)
-    monkeypatch.setattr(agent_runtime, "_AGENT_REVISION", None)
+    revision = _git(source_dir, "rev-parse", "HEAD")
+    original_stat = module_file.stat()
+    monkeypatch.setattr(agent_runtime, "_AGENT_SOURCE_DIR", source_dir.resolve())
+    monkeypatch.setattr(
+        agent_runtime, "_AGENT_MODULE_PATH", module_file.resolve()
+    )
+    monkeypatch.setattr(agent_runtime, "_AGENT_REVISION", revision)
     monkeypatch.setattr(
         agent_runtime,
         "_AGENT_MODULE_MTIME_NS",
-        None,
+        original_stat.st_mtime_ns,
         raising=False,
     )
-    revisions = ["deadbeef", None, None]
-    monkeypatch.setattr(
-        agent_runtime,
-        "_read_agent_revision",
-        lambda _path, **_kwargs: revisions.pop(0),
+
+    (source_dir / ".git").rename(tmp_path / "hidden-agent-git")
+    module_file.write_bytes(b"class AIAgent: gasp\n")
+    os.utime(
+        module_file,
+        ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
     )
+    fresh_stat = module_file.stat()
+    assert fresh_stat.st_size == original_stat.st_size
+    assert fresh_stat.st_mtime_ns == original_stat.st_mtime_ns
 
-    agent_runtime._capture_loaded_agent_revision()
-
-    assert agent_runtime._AGENT_REVISION == "deadbeef"
-
-    agent_runtime.ensure_agent_runtime_current()
-
-    assert agent_runtime._AGENT_MODULE_MTIME_NS == module_file.stat().st_mtime_ns
-    monkeypatch.setattr(
-        agent_runtime,
-        "_AGENT_MODULE_MTIME_NS",
-        module_file.stat().st_mtime_ns + 1,
-    )
     with pytest.raises(agent_runtime.AgentRuntimeChangedError):
         agent_runtime.ensure_agent_runtime_current()
 
