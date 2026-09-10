@@ -934,6 +934,9 @@ def read_bounded_session_tail(
         session = Session(**metadata)
     except Exception as error:
         raise BoundedTailUnsupported("bounded metadata cannot construct Session") from error
+    from api.models import _overlay_composer_draft_sidecar
+
+    _overlay_composer_draft_sidecar(session)
     session.messages = list(messages)
     session._loaded_metadata_only = True
     session._metadata_message_count = count

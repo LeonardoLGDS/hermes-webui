@@ -1,8 +1,10 @@
 """Regression coverage for the multi-megabyte composer-draft save defect."""
 
 import hashlib
+import io
 import json
 import os
+from urllib.parse import urlparse
 
 import pytest
 
@@ -22,6 +24,64 @@ def isolated_session_store(tmp_path, monkeypatch):
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", {})
     return session_dir
+
+
+class _Handler:
+    def __init__(self, path):
+        self.path = path
+        self.headers = {}
+        self.wfile = io.BytesIO()
+        self.status = None
+        self.response_headers = {}
+
+    def send_response(self, status):
+        self.status = status
+
+    def send_header(self, key, value):
+        self.response_headers[key] = value
+
+    def end_headers(self):
+        pass
+
+
+@pytest.fixture
+def http_state(tmp_path, monkeypatch):
+    from collections import OrderedDict
+
+    from api import config, helpers, models, profiles, routes, wsbound
+
+    monkeypatch.setattr(config, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(models, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(routes, "SESSION_DIR", tmp_path)
+    monkeypatch.setattr(config, "SESSIONS", OrderedDict())
+    monkeypatch.setattr(models, "SESSIONS", config.SESSIONS)
+    monkeypatch.setattr(routes, "SESSIONS", config.SESSIONS)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", tmp_path / "_index.json")
+    monkeypatch.setattr(routes, "SETTINGS_FILE", tmp_path / "settings.json")
+    monkeypatch.setattr(
+        routes, "_active_state_db_path", lambda: tmp_path / "state.db"
+    )
+    monkeypatch.setattr(profiles, "get_active_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
+    monkeypatch.setattr(models, "_get_profile_home", lambda profile: tmp_path)
+    monkeypatch.setattr(
+        models, "_active_state_db_path", lambda: tmp_path / "state.db"
+    )
+    monkeypatch.setattr(helpers, "_security_headers", lambda handler: None)
+    monkeypatch.setattr(
+        helpers, "flush_pending_auth_cookies", lambda handler: None
+    )
+    monkeypatch.setattr(
+        wsbound, "RESPONSES", wsbound.ByteLRU(8 * 1024 * 1024)
+    )
+    monkeypatch.setattr(
+        wsbound, "COMPILES", wsbound.AdmissionGate(512 * 1024 * 1024)
+    )
+    monkeypatch.setattr(wsbound, "pressure_health", lambda: {"shed": False})
+    monkeypatch.setattr(
+        config, "session_writeback_owner", lambda sid: None
+    )
+    return routes, models, tmp_path
 
 
 def _write_large_session(session_dir, *, draft=None):
@@ -201,3 +261,126 @@ def test_session_without_sidecar_loads_exactly_as_before(isolated_session_store)
     session = models.Session.load(SID)
     assert session.composer_draft == {"text": "legacy", "files": ["legacy.txt"]}
     assert session.messages == messages
+
+
+def _write_http_draft_session(http_state, sid="http-draft"):
+    routes, models, directory = http_state
+    payload = {
+        "session_id": sid,
+        "title": "Draft load paths",
+        "workspace": str(directory),
+        "created_at": 1.0,
+        "updated_at": 2.0,
+        "message_count": 2,
+        "composer_draft": {"text": "embedded", "files": []},
+        "messages": [
+            {"role": "user", "content": "one", "timestamp": 1.0},
+            {"role": "assistant", "content": "two", "timestamp": 2.0},
+        ],
+    }
+    path = directory / f"{sid}.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return models.Session(**payload), path
+
+
+def _request_draft(http_state, sid):
+    handler = _Handler(
+        f"/api/session?session_id={sid}&resolve_model=0&messages=1&msg_limit=30"
+    )
+    http_state[0].handle_get(handler, urlparse(handler.path))
+    body = json.loads(handler.wfile.getvalue())
+    assert handler.status == 200
+    return body["session"]["composer_draft"]
+
+
+@pytest.mark.parametrize("query", ["messages=0", "messages=1&msg_limit=30"])
+def test_http_metadata_and_bounded_responses_overlay_durable_draft(
+    http_state, query
+):
+    session, _path = _write_http_draft_session(http_state)
+    session.save_composer_draft({"text": "durable", "files": []})
+    handler = _Handler(
+        f"/api/session?session_id={session.session_id}&resolve_model=0&{query}"
+    )
+    http_state[0].handle_get(handler, urlparse(handler.path))
+    body = json.loads(handler.wfile.getvalue())
+    assert handler.status == 200
+    assert body["session"]["composer_draft"] == {"text": "durable", "files": []}
+
+
+def test_http_cold_full_reopen_overlays_durable_draft(http_state, monkeypatch):
+    from api import bounded_session_tail
+
+    session, _path = _write_http_draft_session(http_state, "http-cold-full")
+    session.save_composer_draft({"text": "cold durable", "files": []})
+
+    def unsupported(*_args, **_kwargs):
+        raise bounded_session_tail.BoundedTailUnsupported("forced cold reopen")
+
+    monkeypatch.setattr(
+        bounded_session_tail, "read_bounded_session_tail", unsupported
+    )
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "cold durable",
+        "files": [],
+    }
+
+
+def test_http_sidecar_identity_selects_between_stale_equal_and_corrupt_drafts(
+    http_state,
+):
+    session, path = _write_http_draft_session(http_state)
+    sidecar = path.with_suffix(".json.draft")
+    session.save_composer_draft({"text": "durable", "files": []})
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "durable",
+        "files": [],
+    }
+    # An unchanged identity must continue returning the same durable value.
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "durable",
+        "files": [],
+    }
+
+    # An equal sidecar is safe: it intentionally preserves the same value.
+    session.save_composer_draft({"text": "durable", "files": []})
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "durable",
+        "files": [],
+    }
+
+    # A stale sidecar cannot outrank the newer transcript's embedded draft.
+    sidecar.write_text(
+        json.dumps(
+            {"version": 1, "draft": {"text": "stale", "files": []}}
+        ),
+        encoding="utf-8",
+    )
+    stale_ns = path.stat().st_mtime_ns - 1_000_000_000
+    os.utime(sidecar, ns=(stale_ns, stale_ns))
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "embedded",
+        "files": [],
+    }
+
+    # A corrupt newer sidecar fails closed to the embedded draft.
+    sidecar.write_text("{corrupt", encoding="utf-8")
+    corrupt_ns = path.stat().st_mtime_ns + 1_000_000_000
+    os.utime(sidecar, ns=(corrupt_ns, corrupt_ns))
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "embedded",
+        "files": [],
+    }
+
+
+def test_http_response_cache_misses_after_new_draft_sidecar_write(http_state):
+    session, _path = _write_http_draft_session(http_state, "draft-cache")
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "embedded",
+        "files": [],
+    }
+    session.save_composer_draft({"text": "after cache", "files": []})
+    assert _request_draft(http_state, session.session_id) == {
+        "text": "after cache",
+        "files": [],
+    }

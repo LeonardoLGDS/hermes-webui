@@ -6,6 +6,7 @@ import threading
 import time
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -100,8 +101,12 @@ def probe(state, sid, suffix="&msg_limit=30"):
 def test_large_tail(state, resident, clean):
     make_session(state, "large", resident=resident, clean=clean)
     status, payload = probe(state, "large")
-    assert status == 200
-    assert 0 < len(payload["session"]["messages"]) <= 30
+    expected = 200 if resident else 429
+    assert status == expected
+    if expected == 200:
+        assert 0 < len(payload["session"]["messages"]) <= 30
+    else:
+        assert payload == {"error": "memory_budget"}
 
 
 @pytest.mark.parametrize("suffix", ["&msg_limit=30", "&msg_limit=5", ""])
@@ -125,7 +130,7 @@ def test_resident_never_reads_sidecar_body(state, monkeypatch, suffix):
 
 @pytest.mark.parametrize("resident", [False, True])
 def test_oversized_window_is_413(state, resident):
-    make_session(state, "oversized", resident=resident, oversized=True)
+    make_session(state, "oversized", resident=resident, oversized=True, large=False)
     status, payload = probe(state, "oversized")
     assert status == 413
     assert payload == {"error": "message_window_too_large", "max_bytes": 1572864}
@@ -134,27 +139,30 @@ def test_oversized_window_is_413(state, resident):
 def test_legacy_large_bare_load(state):
     make_session(state, "legacy")
     status, payload = probe(state, "legacy", "")
-    assert status == 200
-    assert 0 < len(payload["session"]["messages"]) <= 200
+    assert status == 429
+    assert payload == {"error": "memory_budget"}
 
 
 @pytest.mark.parametrize("resident,clean", [(False, False), (False, True), (True, True)])
 def test_two_large_loads_default_gate(state, monkeypatch, resident, clean):
     for sid in ("concurrent-a", "concurrent-b"):
         make_session(state, sid, resident=resident, clean=clean)
+    reaches_response_builder = resident
     barrier = threading.Barrier(2)
     overlap = []
     admitted = threading.Barrier(
         2, action=lambda: overlap.append(state[2].COMPILES.snapshot()["active"]),
-    )
+    ) if reaches_response_builder else None
     routes = state[0]
     original_impl = routes._handle_get_impl
 
     def overlapping_impl(handler, parsed):
-        admitted.wait(timeout=5)
+        if admitted is not None:
+            admitted.wait(timeout=5)
         return original_impl(handler, parsed)
 
-    monkeypatch.setattr(routes, "_handle_get_impl", overlapping_impl)
+    if reaches_response_builder:
+        monkeypatch.setattr(routes, "_handle_get_impl", overlapping_impl)
 
     def load(sid):
         barrier.wait(timeout=5)
@@ -163,8 +171,10 @@ def test_two_large_loads_default_gate(state, monkeypatch, resident, clean):
     with ThreadPoolExecutor(max_workers=2) as pool:
         statuses = sorted(pool.map(load, ("concurrent-a", "concurrent-b")))
     print(f"CONCURRENT resident={resident}, clean={clean}, default=536870912: {statuses}")
-    assert statuses == [200, 200]
-    assert overlap == [2]
+    expected = [200, 200] if reaches_response_builder else [429, 429]
+    assert statuses == expected
+    if reaches_response_builder:
+        assert overlap == [2]
     gate = state[2].COMPILES.snapshot()
     assert gate["bytes"] == gate["active"] == gate["queued"] == 0
 
@@ -228,12 +238,12 @@ def test_large_clean_session_attempts_bounded_proof(state, monkeypatch):
         return original_read(*args, **kwargs)
 
     monkeypatch.setattr(bounded_session_tail, "read_bounded_session_tail", observed_read)
-    assert probe(state, "large-clean")[0] == 200
+    assert probe(state, "large-clean")[0] == 429
     assert len(attempts) == 1
 
 
 def test_resident_bypasses_disk_stamped_response_cache(state):
-    session, path = make_session(state, "cache", clean=True)
+    session, path = make_session(state, "cache", clean=True, large=False)
     assert probe(state, "cache")[0] == 200
     assert state[2].RESPONSES.snapshot()["entries"] > 0
     stamp = path.stat()
@@ -281,6 +291,48 @@ def test_resident_appearing_before_response_builder_wins(state, monkeypatch):
     assert payload["session"]["messages"][-1]["content"] == "late resident answer"
 
 
+def test_resident_appearing_after_cold_admission_wins(state, monkeypatch):
+    """A late graph must rescue a request without nesting reservations."""
+    from api import bounded_session_tail
+
+    session, _path = make_session(state, "admission-resident", clean=True, large=False)
+    session.messages[-1]["content"] = "admission resident answer"
+    session.pending_user_message = "unsaved prompt"
+    routes, _models, wsbound, _directory = state
+    original_admit = wsbound.COMPILES.admit
+    charges = []
+
+    @contextmanager
+    def publish_during_cold_admission(cost):
+        charges.append(cost)
+        with original_admit(cost):
+            # The first admission is the bounded proof. Publishing on the
+            # second (cold) admission models residency arriving after queueing.
+            if len(charges) == 2:
+                routes.SESSIONS[session.session_id] = session
+            yield
+
+    monkeypatch.setattr(wsbound.COMPILES, "admit", publish_during_cold_admission)
+    monkeypatch.setattr(
+        bounded_session_tail,
+        "read_bounded_session_tail",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            bounded_session_tail.BoundedTailUnsupported("forced cold admission")
+        ),
+    )
+    status, payload = probe(state, session.session_id)
+    assert status == 200
+    assert payload["session"]["messages"][-1]["content"] == "admission resident answer"
+    cold_cost = max(8 * 1024 * 1024, 2 * (_path).stat().st_size) * 12
+    resident_cost = (8 * 1024 * 1024 + 30 * 4096) * 12 + 1572864
+    assert charges == [
+        bounded_session_tail.BOUNDED_GATE_COST,
+        cold_cost,
+        resident_cost,
+    ]
+    assert wsbound.COMPILES.snapshot()["active"] == 0
+
+
 def test_writeback_owner_blocks_disk_proof(state, monkeypatch):
     from api import bounded_session_tail, config
 
@@ -290,7 +342,40 @@ def test_writeback_owner_blocks_disk_proof(state, monkeypatch):
         bounded_session_tail, "read_bounded_session_tail",
         lambda *args, **kwargs: pytest.fail("dirty disk proof"),
     )
-    assert probe(state, "owned")[0] == 200
+    assert probe(state, "owned")[0] == 429
+
+
+@pytest.mark.parametrize("writer_authoritative", [False, True])
+def test_external_append_refreshes_clean_but_not_dirty_resident(
+    state, writer_authoritative
+):
+    sid = "dirty" if writer_authoritative else "clean-external"
+    session, path = make_session(state, sid, clean=True, large=False)
+    state[0].SESSIONS[sid] = session
+    if writer_authoritative:
+        session.pending_user_message = "unsaved prompt"
+        session.messages[-1]["content"] = "unsaved resident answer"
+
+    disk_payload = json.loads(path.read_text(encoding="utf-8"))
+    disk_payload["message_count"] = len(disk_payload["messages"]) + 1
+    disk_payload["updated_at"] = len(disk_payload["messages"]) + 1
+    disk_payload["messages"].append(
+        {
+            "role": "assistant",
+            "content": "external append",
+            "timestamp": len(disk_payload["messages"]) + 1,
+        }
+    )
+    path.write_text(json.dumps(disk_payload), encoding="utf-8")
+
+    status, payload = probe(state, sid)
+    assert status == 200
+    if writer_authoritative:
+        assert payload["session"]["messages"][-1]["content"] == "unsaved resident answer"
+        assert "external append" not in payload["session"]["messages"]
+    else:
+        assert payload["session"]["messages"][-1]["content"] == "external append"
+    assert state[2].COMPILES.snapshot()["bytes"] == 0
 
 
 @pytest.mark.parametrize("rows", [[], [{"role": "user", "content": "one"}]])

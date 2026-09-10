@@ -702,6 +702,27 @@ def test_source_stamp_still_tracks_wal_when_idle(tmp_path, monkeypatch):
     assert after != before
 
 
+def test_source_stamp_tracks_draft_sidecars_during_streaming(
+    tmp_path, monkeypatch
+):
+    """Draft saves remain sidebar-fresh even while transcript stamps freeze."""
+    key, _wal, _settings, _fingerprint = _build_stamp_env(tmp_path, monkeypatch)
+    session_dir = routes.SESSION_DIR
+    sidecar = session_dir / "session.json.draft"
+    sidecar.write_text(
+        '{"version":1,"draft":{"text":"before"}}', encoding="utf-8"
+    )
+    monkeypatch.setattr(routes, "_active_stream_ids", lambda: {"turn-1"})
+
+    before = routes._session_list_cache_source_stamp(key)
+    sidecar.write_text(
+        '{"version":1,"draft":{"text":"after"}}', encoding="utf-8"
+    )
+    after = routes._session_list_cache_source_stamp(key)
+
+    assert after != before
+
+
 def _streaming_ttl_key():
     return routes._session_list_cache_key(
         active_profile="default",

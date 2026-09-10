@@ -1,5 +1,6 @@
 """Session-list cache helpers extracted from api.routes."""
 
+import hashlib
 import os
 import copy
 import re
@@ -407,7 +408,55 @@ def _session_list_cache_state_db_fingerprint_impl(state_db_path: Path | None):
         return None
 
 
-def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], object, int]:
+def _session_list_cache_draft_sidecar_stamp() -> object:
+    """Fold every durable draft identity into the sidebar source stamp.
+
+    Draft saves intentionally leave the transcript, index, and state.db
+    unchanged.  The aggregate is bounded to exact stat identities and fails
+    closed to an always-changing marker when the directory cannot be enumerated
+    or an individual sidecar cannot be validated.
+    """
+    try:
+        entries = []
+        for entry in _session_list_cache_session_dir().iterdir():
+            try:
+                name = entry.name
+            except OSError:
+                return ("draft-identity-error", time.monotonic_ns())
+            if not name.endswith(".json.draft"):
+                continue
+            try:
+                stat_result = entry.stat()
+            except OSError:
+                return ("draft-identity-error", time.monotonic_ns())
+            identity = (
+                int(stat_result.st_dev),
+                int(stat_result.st_ino),
+                int(stat_result.st_size),
+                int(stat_result.st_mtime_ns),
+                int(stat_result.st_ctime_ns),
+            )
+            entries.append((name, identity))
+        if not entries:
+            return (0, b"", 0, 0)
+        digest = hashlib.sha256()
+        for name, identity in sorted(entries, key=lambda item: os.fsencode(item[0])):
+            digest.update(os.fsencode(name))
+            digest.update(b"\0")
+            for component in identity:
+                digest.update(str(component).encode("ascii"))
+                digest.update(b"\0")
+        return (
+            len(entries),
+            digest.digest(),
+            sum(item[1][2] for item in entries),
+            max(item[1][3] for item in entries),
+        )
+    except Exception:
+        return ("draft-identity-error", time.monotonic_ns())
+
+
+def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], tuple[int, int], object, int, object]:
     _cache_profile, _cache_all_profiles, _cache_show_cli_sessions, *_rest = key
     try:
         swv = _session_list_cache_settings_write_version()
@@ -428,6 +477,10 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
     # immediately. Skipping the fingerprint's SQLite connect here also makes the
     # streaming-path stamp strictly cheaper than the idle path.
     streaming_marker = _session_list_cache_streaming_freeze_marker()
+    # Draft sidecars remain live during the streaming hold-down: they are fixed
+    # stat reads, do not connect SQLite, and intentionally do not mutate the
+    # transcript/state components frozen below.
+    draft_stamp = _session_list_cache_draft_sidecar_stamp()
     if streaming_marker is not None:
         return (
             streaming_marker,
@@ -437,6 +490,7 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
             _session_list_cache_path_stamp(_session_list_cache_settings_file()),
             streaming_marker,
             swv,
+            draft_stamp,
         )
     try:
         state_db_path = Path(_session_list_cache_state_db_path())
@@ -466,6 +520,7 @@ def _session_list_cache_source_stamp(key: tuple) -> tuple[tuple[int, int], tuple
         # could be served stale for the cache TTL. Mirrors the models-layer fix.
         _session_list_cache_state_db_fingerprint(state_db_path),
         swv,
+        draft_stamp,
     )
 
 
