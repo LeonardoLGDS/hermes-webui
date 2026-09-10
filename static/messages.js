@@ -7880,7 +7880,8 @@ async function respondApproval(choice, options = {}) {
     });
     if (!_approvalResponseOwnerIsCurrent(owner)) {
       _releaseApprovalResponseOwner(owner);
-      _setApprovalRetryStatus("Approval response completed after the prompt changed.");
+      // WHY: test_card_yolo_ignores_response_from_prior_same_session_generation
+      // requires superseded successful responses to be ignored silently.
       return false;
     }
     if (result && result.ok) {
@@ -7899,10 +7900,31 @@ async function respondApproval(choice, options = {}) {
       _approvalSessionId = null;
       _approvalCurrentId = null;
       _approvalClearedOwner = owner;
-      // Stop stale polling before it can repaint the just-approved prompt.
-      stopApprovalPollingForSession(sid);
-      void _recheckApprovalAfterConfirmedResponse(owner);
+      // WHY: test_approval_card_yolo_resumes_current_prompt_with_one_webui_request,
+      // test_approval_card_yolo_marks_skip_all_busy_while_request_is_pending,
+      // test_approval_card_yolo_uses_authoritative_disabled_response, and
+      // test_card_yolo_accepts_success_after_polling_retires_projection require
+      // confirmed YOLO success without an unconditional pending-state recheck.
+      if (!options.yolo) {
+        stopApprovalPollingForSession(sid);
+        void _recheckApprovalAfterConfirmedResponse(owner);
+      }
       hideApprovalCard(true);
+      // WHY: test_stale_clear_preserves_case_distinct_pending_successor requires
+      // a stale-cleared YOLO requery to preserve successor state and ownership.
+      if (options.yolo && result.stale_cleared) {
+        void (async () => {
+          if (!_approvalClearedOwnerMayRefresh(owner)) return;
+          try {
+            const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid), {timeoutToast: false});
+            if (!_approvalClearedOwnerMayRefresh(owner)) return;
+            _approvalClearedOwner = null;
+            if (data && data.pending) showApprovalForSession(sid, data.pending, data.pending_count || 1);
+          } catch (_) {
+            if (_approvalClearedOwner === owner) _approvalClearedOwner = null;
+          }
+        })();
+      }
       if (options.yolo) showToast(t(_yoloEnabled ? 'yolo_enabled' : 'yolo_disabled'));
       return options.yolo ? result : true;
     }
@@ -7919,7 +7941,8 @@ async function respondApproval(choice, options = {}) {
       || (t("approval_responding") + " failed");
     if (!_approvalResponseOwnerIsCurrent(owner)) {
       _releaseApprovalResponseOwner(owner);
-      _setApprovalRetryStatus("Approval response failed after the prompt changed.");
+      // WHY: test_card_yolo_ignores_response_from_prior_same_session_generation[same-generation-error]
+      // requires superseded failed responses to be ignored silently.
       return false;
     }
     if (options.yolo) _applyApprovalYoloProjection(errorPayload);
