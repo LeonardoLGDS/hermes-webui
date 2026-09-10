@@ -186,6 +186,109 @@ def _safe_replace(src: Path, dst: Path) -> None:
             delay *= 2  # 50 -> 100 -> 200 -> 400 -> 800 ms
 
 
+_DRAFT_SIDECAR_VERSION = 1
+
+
+def _draft_sidecar_path(sid: str) -> Path:
+    """Return the optional composer-draft path for a safe session id."""
+    # WHY: draft-save latency defect — keep the tiny draft outside the large transcript.
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}; refusing draft sidecar path")
+    return SESSION_DIR / f'{sid}.json.draft'
+
+
+def _write_draft_sidecar(sid: str, draft: dict) -> None:
+    """Durably replace the draft sidecar without touching the transcript."""
+    # WHY: draft-save latency defect — serialize only the composer, never all messages.
+    path = _draft_sidecar_path(sid)
+    payload = json.dumps(
+        {'version': _DRAFT_SIDECAR_VERSION, 'draft': draft},
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    tmp = path.with_suffix(
+        f'.draft.tmp.{os.getpid()}.{threading.current_thread().ident}'
+    )
+    replaced = False
+    try:
+        with open(tmp, 'w', encoding='utf-8') as sidecar_file:
+            sidecar_file.write(payload)
+            sidecar_file.flush()
+            os.fsync(sidecar_file.fileno())
+        _safe_replace(tmp, path)
+        replaced = True
+        if os.name != 'nt':
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except Exception:
+        if not replaced:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _load_composer_draft_sidecar(sid: str) -> dict | None:
+    """Return a strictly newer valid draft, or ``None`` for safe fallback."""
+    # WHY: draft-crash consistency — newer durable drafts win without blocking loads.
+    if not is_safe_session_id(sid):
+        return None
+    sidecar = _draft_sidecar_path(sid)
+    session_path = SESSION_DIR / f'{sid}.json'
+
+    def _stat_signature(path: Path):
+        stat_result = path.stat()
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+        )
+
+    for _attempt in range(2):
+        try:
+            before_sidecar = _stat_signature(sidecar)
+            before_session = _stat_signature(session_path)
+            if before_sidecar[3] <= before_session[3]:
+                return None
+            payload = json.loads(sidecar.read_text(encoding='utf-8'))
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {'version', 'draft'}
+                or type(payload.get('version')) is not int
+                or payload.get('version') != _DRAFT_SIDECAR_VERSION
+                or not isinstance(payload.get('draft'), dict)
+            ):
+                raise ValueError('sidecar is not a version-1 draft envelope')
+            if (
+                _stat_signature(sidecar) != before_sidecar
+                or _stat_signature(session_path) != before_session
+            ):
+                continue
+            return payload['draft']
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Unusable composer draft sidecar for session %s (%s); "
+                "falling back to the session transcript draft",
+                sid,
+                exc,
+                exc_info=True,
+            )
+            return None
+    logger.warning(
+        "Composer draft sidecar for session %s changed during read; "
+        "falling back to the session transcript draft",
+        sid,
+    )
+    return None
+
+
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
@@ -1622,6 +1725,21 @@ class Session:
     def path(self):
         return SESSION_DIR / f'{self.session_id}.json'
 
+    def save_composer_draft(self, draft: dict) -> None:
+        """Persist only the composer draft and never the message transcript."""
+        # WHY: draft-save latency defect — adopt the draft only after its durable write.
+        if not isinstance(draft, dict):
+            raise TypeError("composer draft must be a JSON object")
+        if not self.path.exists() and not (self.messages or []):
+            # WHY: draft-save latency defect — keep new-chat drafts restart-durable.
+            previous_draft = self.composer_draft
+            self.composer_draft = copy.deepcopy(draft)
+            try:
+                self.save(touch_updated_at=False, skip_index=True)
+            finally:
+                self.composer_draft = previous_draft
+        _write_draft_sidecar(self.session_id, copy.deepcopy(draft))
+
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
             raise ValueError(f"Unsafe session_id {self.session_id!r}; refusing to write outside session store")
@@ -1845,6 +1963,10 @@ class Session:
         data = json.loads(read_source_text(p))
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
         session = cls(**data)
+        # WHY: draft-save latency defect — overlay newer drafts after transcript parsing.
+        sidecar_draft = _load_composer_draft_sidecar(sid)
+        if sidecar_draft is not None:
+            session.composer_draft = sidecar_draft
         if _collapsed_partials:
             try:
                 # Self-heal bloated sessions on first full load without touching

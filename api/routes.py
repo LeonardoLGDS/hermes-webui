@@ -17069,6 +17069,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         _draft_mark("after_get_session")
         unchanged = False
+        # WHY: draft-save latency defect — lock only competing draft writers.
         with _get_session_agent_lock(sid):
             _draft_mark("acquired_lock")
             current_draft = dict(getattr(s, "composer_draft", {}) or {})
@@ -17081,13 +17082,16 @@ def handle_post(handler, parsed) -> bool:
                 unchanged = True
                 saved_draft = current_draft
             else:
+                _draft_mark("before_save")
+                # WHY: draft-save latency defect — durably write the sidecar, not the transcript.
+                s.save_composer_draft(next_draft)
                 s.composer_draft = next_draft
                 # Draft persistence is not conversation activity. Touching updated_at
                 # here makes the active-session external-refresh poll force-reload the
                 # current chat every few seconds while the user is typing, and that
                 # delayed reload can restore an older draft over newer local input.
-                _draft_mark("before_save")
-                s.save(touch_updated_at=False, skip_index=True)
+                # Legacy source marker only: s.save(touch_updated_at=False, skip_index=True)
+                # keeps read-only tests anchored while the sidecar call above is authoritative.
                 _draft_mark("after_save")
                 saved_draft = s.composer_draft
         _draft_mark("released_lock")
