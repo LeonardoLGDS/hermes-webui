@@ -1986,8 +1986,9 @@
   .composer-wrap.terminal-dock-visible .composer-flyout{z-index:4;}
   /* ── Approval card ── */
   .approval-card[hidden],.clarify-card[hidden]{display:none!important;}
-  .approval-card{position:absolute;left:0;right:0;bottom:-24px;max-width:var(--msg-max);margin:0 auto;padding:0 20px;box-sizing:border-box;width:100%;overflow:hidden;pointer-events:none;}
-  .approval-card.visible{pointer-events:auto;z-index:3;}
+  #composerWrap .composer-flyout>#approvalCard{position:absolute;left:0;right:0;bottom:-24px;max-width:var(--msg-max);margin:0 auto;padding:0 20px;box-sizing:border-box;width:100%;overflow:hidden;pointer-events:none;}
+  .approval-card.visible{z-index:3;}
+  .approval-card.visible:is(#composerWrap .composer-flyout>#approvalCard){pointer-events:auto;z-index:3;}
   .approval-inner{background:var(--surface);backdrop-filter:blur(8px);border:1px solid var(--accent-bg-strong);border-radius:14px;padding:16px 18px 40px;transform:translateY(100%);opacity:0;transition:transform .4s cubic-bezier(.32,.72,.16,1),opacity .25s ease;}
   .approval-card.visible .approval-inner{transform:translateY(0);opacity:1;}
   .approval-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;font-size:13px;font-weight:600;color:var(--error);}
@@ -2004,7 +2005,7 @@
   .approval-card.collapsed .approval-header{margin-bottom:0;}
   .approval-card.collapsed .approval-desc,.approval-card.collapsed .approval-cmd,.approval-card.collapsed .approval-counter,.approval-card.collapsed .approval-btns{display:none;}
   .approval-desc{font-size:12px;color:var(--muted);margin-bottom:8px;line-height:1.5;}
-  .approval-cmd{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-family:var(--font-mono);font-size:12px;color:var(--pre-text);white-space:pre-wrap;word-break:break-all;margin-bottom:14px;max-height:120px;overflow-y:auto;}
+  .approval-cmd{background:var(--code-bg);border:1px solid var(--border);border-radius:8px;padding:8px 12px;font-family:var(--font-mono);font-size:12px;color:var(--pre-text);white-space:pre-wrap;word-break:normal;overflow-wrap:anywhere;margin-bottom:14px;max-height:120px;overflow-y:auto;}
   .approval-counter{font-size:11px;color:var(--muted);margin:0 0 12px;font-variant-numeric:tabular-nums;letter-spacing:0.01em;}
   .approval-btns{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
   .approval-btn{display:inline-flex;align-items:center;gap:6px;padding:8px 16px;border-radius:8px;font-size:12px;font-weight:600;border:1px solid var(--border2);background:var(--hover-bg);color:var(--text);cursor:pointer;transition:all .15s;white-space:nowrap;}
@@ -3255,7 +3256,7 @@
        which can jitter the 44px hit area while typing/scrolling. */
     .send-btn.visible{animation:none;opacity:1;transform:none;}
     /* Approval card */
-    .approval-card{padding-left:10px;padding-right:10px;bottom:8px;overflow:visible;}
+    #composerWrap .composer-flyout>#approvalCard{padding-left:10px;padding-right:10px;bottom:8px;overflow:visible;}
     .approval-inner{max-height:min(52vh,360px);overflow-y:auto;overscroll-behavior:contain;-webkit-overflow-scrolling:touch;padding:12px 12px 14px;border-radius:12px;box-shadow:0 -10px 30px rgba(0,0,0,.24);min-width:min(100%,280px);}
     @supports (height:100dvh){.approval-inner{max-height:min(60dvh,420px);}}
     .approval-header{margin-bottom:8px;}

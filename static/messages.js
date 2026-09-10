@@ -7662,6 +7662,22 @@ function showApprovalCard(pending, pendingCount) {
     responding,
   );
   _setPromptFlyoutHidden(card, false);
+  // WHY: a previously hidden approval card can be stuck-inert when a late
+  // render path or extension paints it, which makes every visible button look
+  // dead. Make the actual card interactive immediately before visibility, then
+  // use one bounded frame re-check for a renderer that restores `inert` during
+  // the same paint.
+  card.hidden = false;
+  card.removeAttribute("inert");
+  card.setAttribute("aria-hidden", "false");
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(() => {
+      if (!card.classList.contains("visible")) return;
+      card.hidden = false;
+      card.removeAttribute("inert");
+      card.setAttribute("aria-hidden", "false");
+    });
+  }
   card.classList.add("visible");
   _syncApprovalCollapseButton(card);
   _syncApprovalTranscriptSpace(card, {immediate: true});
@@ -7740,6 +7756,74 @@ function _restoreFailedApprovalResponse(owner, errMsg) {
   if (typeof setStatus === "function") setStatus(errMsg);
 }
 
+function _setApprovalRetryStatus(message) {
+  if (typeof setStatus === "function") setStatus(message);
+  else if (typeof setComposerStatus === "function") setComposerStatus(message);
+}
+
+function _recaptureApprovalResponseOwnerFromActivePending() {
+  const card = $("approvalCard");
+  const sid = _promptActiveSessionId();
+  if (
+    !card ||
+    !card.classList.contains("visible") ||
+    !sid ||
+    (_approvalSessionId && _approvalSessionId !== sid) ||
+    !_approvalPendingBySession.has(sid)
+  ) return null;
+  _renderPendingApprovalForActiveSession();
+  return _captureApprovalResponseOwner();
+}
+
+async function _recheckApprovalAfterConfirmedResponse(owner) {
+  let data = null;
+  let failed = false;
+  try {
+    data = await api("/api/approval/pending?session_id=" + encodeURIComponent(owner.sid), {
+      timeoutToast: false,
+    });
+  } catch (_) {
+    failed = true;
+  }
+  if (
+    !S.session ||
+    S.session.session_id !== owner.sid ||
+    _loadSessionGeneration !== owner.generation
+  ) return;
+
+  if (failed) {
+    // The response was confirmed, so keep the immediate dismissal; still tell
+    // the user that this one confirmation read failed rather than pretending
+    // the client knows the server's pending state.
+    _setApprovalRetryStatus("Approval sent; pending state could not be confirmed.");
+    return;
+  }
+
+  const pending = data && data.pending;
+  const pendingOwner = _approvalOwnerForPending(owner.sid, pending);
+  if (pending && _approvalOwnerIdentityMatches(pendingOwner, owner)) {
+    // WHY: approval-linger can occur when a confirmed response races a stale
+    // pending snapshot. Repaint only with an explicit retry/error message and
+    // controls re-enabled; never silently restore the approved prompt.
+    startApprovalPolling(owner.sid);
+    showApprovalForSession(owner.sid, pending, data.pending_count || 1);
+    const message = "Approval was accepted but is still pending. Please try again.";
+    _setApprovalRetryStatus(message);
+    if (typeof showToast === "function") showToast(message, 5000);
+    return;
+  }
+
+  _clearApprovalPendingForSession(owner.sid);
+  if (pending) {
+    // A confirmed response stops the old poll, so restore polling only when the
+    // server still has a queued prompt for this same session.
+    startApprovalPolling(owner.sid);
+    showApprovalForSession(owner.sid, pending, data.pending_count || 1);
+  } else {
+    hideApprovalCard(true);
+  }
+}
+
 function _applyApprovalYoloProjection(result) {
   if (!result || typeof result.yolo_enabled !== "boolean") return;
   _yoloEnabled = result.yolo_enabled;
@@ -7756,8 +7840,24 @@ function toggleApprovalCardCollapsed(forceCollapsed) {
 }
 
 async function respondApproval(choice, options = {}) {
-  const owner = options.owner || _captureApprovalResponseOwner();
-  if (!_approvalResponseOwnerIsCurrent(owner)) return false;
+  let owner = options.owner || _captureApprovalResponseOwner();
+  if (!_approvalResponseOwnerIsCurrent(owner)) {
+    // WHY: stale local owner metadata must not turn a current user click into
+    // a silent no-op. Refresh the active session's pending owner exactly once;
+    // authorization still comes only from that active session and approval.
+    const freshOwner = options.__approvalOwnerRetry
+      ? null
+      : _recaptureApprovalResponseOwnerFromActivePending();
+    if (freshOwner) {
+      _setApprovalRetryStatus("Approval state refreshed — sending once.");
+      return respondApproval(choice, {...options, owner: freshOwner, __approvalOwnerRetry: true});
+    }
+    const visibleCard = $("approvalCard");
+    if (visibleCard && visibleCard.classList.contains("visible")) {
+      _setApprovalRetryStatus("Approval state changed — please try again.");
+    }
+    return false;
+  }
   const {sid, approvalId} = owner;
   if (_approvalResponseMatches(sid, approvalId, owner.generation, owner)) return false;
   _approvalClearedOwner = null;
@@ -7780,6 +7880,7 @@ async function respondApproval(choice, options = {}) {
     });
     if (!_approvalResponseOwnerIsCurrent(owner)) {
       _releaseApprovalResponseOwner(owner);
+      _setApprovalRetryStatus("Approval response completed after the prompt changed.");
       return false;
     }
     if (result && result.ok) {
@@ -7798,20 +7899,10 @@ async function respondApproval(choice, options = {}) {
       _approvalSessionId = null;
       _approvalCurrentId = null;
       _approvalClearedOwner = owner;
+      // Stop stale polling before it can repaint the just-approved prompt.
+      stopApprovalPollingForSession(sid);
+      void _recheckApprovalAfterConfirmedResponse(owner);
       hideApprovalCard(true);
-      if (result.stale_cleared) {
-        void (async () => {
-          if (!_approvalClearedOwnerMayRefresh(owner)) return;
-          try {
-            const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid), {timeoutToast: false});
-            if (!_approvalClearedOwnerMayRefresh(owner)) return;
-            _approvalClearedOwner = null;
-            if (data && data.pending) showApprovalForSession(sid, data.pending, data.pending_count || 1);
-          } catch (_) {
-            if (_approvalClearedOwner === owner) _approvalClearedOwner = null;
-          }
-        })();
-      }
       if (options.yolo) showToast(t(_yoloEnabled ? 'yolo_enabled' : 'yolo_disabled'));
       return options.yolo ? result : true;
     }
@@ -7828,6 +7919,7 @@ async function respondApproval(choice, options = {}) {
       || (t("approval_responding") + " failed");
     if (!_approvalResponseOwnerIsCurrent(owner)) {
       _releaseApprovalResponseOwner(owner);
+      _setApprovalRetryStatus("Approval response failed after the prompt changed.");
       return false;
     }
     if (options.yolo) _applyApprovalYoloProjection(errorPayload);
@@ -7857,8 +7949,10 @@ function startApprovalPolling(sid) {
 let _approvalEventSource = null;
 let _approvalSSEHealthTimer = null;
 let _approvalPollingSessionId = null;
+let _approvalPollGeneration = 0;
 
 function _startApprovalFallbackPoll(sid) {
+  const pollGeneration = ++_approvalPollGeneration;
   // Run one tick immediately so a session already blocked on a pending approval
   // shows its card instantly (the removed SSE 'initial' event used to do this);
   // then poll on the 1500ms cadence. (#3913 SHOULD-FIX)
@@ -7870,6 +7964,10 @@ function _startApprovalFallbackPoll(sid) {
     _approvalFallbackPollInFlight = true;
     try {
       const data = await api("/api/approval/pending?session_id=" + encodeURIComponent(sid),{timeoutToast:false});
+      // WHY: stopping the timer cannot cancel an already-awaited poll. Without
+      // this generation check, that stale response can repaint an approval that
+      // was just confirmed and dismissed.
+      if (pollGeneration !== _approvalPollGeneration) return;
       if (data.pending) { showApprovalForSession(sid, data.pending, data.pending_count||1); }
       else if (!_approvalPollingSessionMissingOrMismatched(sid)) {
         const _resolvedEntry = _approvalPendingBySession.get(sid);
@@ -7894,6 +7992,7 @@ function stopApprovalPollingForSession(sid) {
 }
 
 function stopApprovalPolling() {
+  _approvalPollGeneration++;
   if (_approvalPollTimer) { clearInterval(_approvalPollTimer); _approvalPollTimer = null; }
   if (_approvalEventSource) { try { if(_approvalEventSource.readyState!==2)_approvalEventSource.close(); } catch(_){} _approvalEventSource = null; }
   if (_approvalSSEHealthTimer) { clearInterval(_approvalSSEHealthTimer); _approvalSSEHealthTimer = null; }

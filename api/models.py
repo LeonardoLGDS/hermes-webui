@@ -189,6 +189,7 @@ def _safe_replace(src: Path, dst: Path) -> None:
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
+_SIDECAR_COUNT_SCAN_PREFIX_BYTES = 8 * 1024 * 1024
 _SESSION_INDEX_REBUILD_LOCK = threading.Lock()
 _SESSION_INDEX_REBUILD_THREAD = None
 _SESSION_INDEX_REBUILD_THREAD_TARGET: tuple[Path, Path] | None = None
@@ -987,6 +988,19 @@ def _is_empty_partial_activity_message(message):
     return not str(content or '').strip()
 
 
+def _is_empty_recovered_stream_anchor(message):
+    """Return True for structural recovered assistant rows with no visible text."""
+    if not isinstance(message, dict):
+        return False
+    # WHY: an empty recovered anchor stores the interrupted stream-start
+    # timestamp and is not user activity, so it cannot date the sidebar.
+    return (
+        message.get('role') == 'assistant'
+        and bool(message.get('_recovered_from_run_journal'))
+        and not str(message.get('content') or '').strip()
+    )
+
+
 def _last_message_timestamp(messages, *, tail_window: int = 8):
     """perf(session-load-latency) Priority 1: bounded tail-scan.
 
@@ -1014,6 +1028,8 @@ def _last_message_timestamp(messages, *, tail_window: int = 8):
             continue
         if _is_empty_partial_activity_message(message):
             continue
+        if _is_empty_recovered_stream_anchor(message):
+            continue
         ts = _message_timestamp(message)
         if ts:
             return ts
@@ -1025,6 +1041,8 @@ def _last_message_timestamp(messages, *, tail_window: int = 8):
         if isinstance(message, dict) and message.get('role') == 'tool':
             continue
         if _is_empty_partial_activity_message(message):
+            continue
+        if _is_empty_recovered_stream_anchor(message):
             continue
         ts = _message_timestamp(message)
         if ts:
@@ -1119,6 +1137,178 @@ def _read_metadata_json_prefix(path, max_prefix_bytes=65536):
                 prefix = prefix[:-1].rstrip()
             return f'{prefix}\n}}'
     return None
+
+
+def _scan_sidecar_message_count(
+    path,
+    max_prefix_bytes: int = _SIDECAR_COUNT_SCAN_PREFIX_BYTES,
+) -> int | None:
+    """Structurally count top-level ``messages`` without a full Session load.
+
+    This is a bounded proof used only when the metadata prefix retained no
+    usable count.  It reads at most eight MiB (the same fixed prefix budget as
+    the bounded tail reader), rejects duplicate/ambiguous top-level members,
+    and skips one array element at a time rather than materializing the whole
+    transcript.  A count is returned only after the ``messages`` array close is
+    visible: complete elements before an unclosed array boundary are not an
+    exact count, and the metadata-only consumer has no authoritative header
+    with which to turn such a value into a safe floor.  Missing, malformed,
+    truncated-before-array-close, or concurrently replaced files therefore
+    return ``None`` so callers preserve their fail-closed behavior.
+    """
+    try:
+        if not isinstance(path, Path):
+            path = Path(path)
+        before = path.stat()
+        with path.open('rb') as fp:
+            raw = fp.read(max_prefix_bytes + 1)
+        after = path.stat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            return None
+    except (OSError, ValueError):
+        return None
+
+    truncated = len(raw) > max_prefix_bytes
+    if truncated:
+        raw = raw[:max_prefix_bytes]
+    # A prefix can end in the middle of a UTF-8 code point even when all JSON
+    # bytes before that boundary are valid.  Dropping only that incomplete final
+    # code point preserves the parser's failure for an unfinished value without
+    # rejecting an otherwise proven non-empty transcript solely because the byte
+    # budget happened to split one multibyte character.
+    try:
+        text = raw.decode('utf-8', errors='ignore' if truncated else 'strict')
+    except UnicodeDecodeError:
+        return None
+
+    decoder = json.JSONDecoder()
+    size = len(text)
+
+    def skip_whitespace(index: int) -> int:
+        while index < size and text[index] in ' \t\r\n':
+            index += 1
+        return index
+
+    index = skip_whitespace(0)
+    if index >= size or text[index] != '{':
+        return None
+    index += 1
+    seen_top_level_keys: set[str] = set()
+
+    while True:
+        index = skip_whitespace(index)
+        if index < size and text[index] == '}':
+            # A structurally complete root with no top-level messages member is
+            # not a proof either way; the caller must not claim non-emptiness.
+            return None
+        if index >= size or text[index] != '"':
+            return None
+        try:
+            key, index = decoder.raw_decode(text, index)
+        except ValueError:
+            return None
+        if not isinstance(key, str) or key in seen_top_level_keys:
+            return None
+        seen_top_level_keys.add(key)
+        index = skip_whitespace(index)
+        if index >= size or text[index] != ':':
+            return None
+        index = skip_whitespace(index + 1)
+
+        if key != 'messages':
+            try:
+                _, index = decoder.raw_decode(text, index)
+            except ValueError:
+                return None
+            index = skip_whitespace(index)
+            if index >= size:
+                # The prefix ended before a messages member was proven.
+                return None
+            if text[index] not in ',}':
+                return None
+            if text[index] == ',':
+                index += 1
+            continue
+
+        if index >= size or text[index] != '[':
+            return None
+        index = skip_whitespace(index + 1)
+        count = 0
+        while True:
+            index = skip_whitespace(index)
+            if index < size and text[index] == ']':
+                index += 1
+                break
+            if index < size and text[index] == ',':
+                if count == 0:
+                    return None
+                index = skip_whitespace(index + 1)
+                continue
+            try:
+                _, index = decoder.raw_decode(text, index)
+            except ValueError:
+                if truncated:
+                    # The budget ended before the array close.  Even complete
+                    # elements visible above cannot prove the array's final
+                    # length: the unread tail may contain the delimiter, more
+                    # elements, or a replacement file.  There is also no usable
+                    # sidecar header on this path to combine with a floor, so
+                    # return no proof rather than presenting a lower bound as
+                    # an exact sidebar count.
+                    return None
+                return None
+            count += 1
+
+        # The array close proves this member's exact count.  Continue through
+        # trailing members visible in the bounded window so a second/ambiguous
+        # ``messages`` key is rejected rather than silently following Python's
+        # last-writer-wins JSON behavior.  If the fixed budget ends after the
+        # closed member, that exact count remains proven even when large
+        # trailing metadata cannot be inspected.
+        while True:
+            index = skip_whitespace(index)
+            if index < size and text[index] == '}':
+                return count
+            if index >= size:
+                return count if truncated else None
+            if text[index] != ',':
+                return None
+            index = skip_whitespace(index + 1)
+            if index >= size or text[index] != '"':
+                return None
+            try:
+                trailing_key, index = decoder.raw_decode(text, index)
+            except ValueError:
+                return None
+            if not isinstance(trailing_key, str) or trailing_key in seen_top_level_keys:
+                return None
+            seen_top_level_keys.add(trailing_key)
+            index = skip_whitespace(index)
+            if index >= size or text[index] != ':':
+                return None
+            index = skip_whitespace(index + 1)
+            try:
+                _, index = decoder.raw_decode(text, index)
+            except ValueError:
+                starts_value = (
+                    index < size
+                    and (
+                        text[index] in '{["-tfn'
+                        or text[index].isdigit()
+                    )
+                )
+                if truncated and starts_value:
+                    # The array close already proved this member's count.  A
+                    # valid-looking trailing value continued past the budget
+                    # cannot change that count, while malformed bytes fail
+                    # closed rather than masking an invalid sidecar.
+                    return count
+                return None
 
 
 def _load_session_from_path(path: Path) -> "Session | None":
@@ -1747,11 +1937,40 @@ class Session:
                     session._metadata_message_count = _parse_nonnegative_int(_facts.get('message_count'))
                     session._loaded_metadata_only = True
                     return session
+                # WHY: both a genuinely empty array and a non-empty array can
+                # reach this metadata-only stub with no usable header.  A full
+                # load would reintroduce the startup stall this loader exists
+                # to prevent, while blindly returning the synthesized empty list
+                # would durably hide a non-empty chat.  The bounded structural
+                # count proves which shape is on disk without reading state.db;
+                # malformed/unproven bytes still take the existing fail-closed
+                # full-load/fallback path below.
+                scanned_count = _scan_sidecar_message_count(p)
+                if scanned_count is not None:
+                    # Keep the unusable header distinct from the bounded proof.
+                    # compact()/_durable_message_count() consumes this transient
+                    # sentinel without a second prefix read.
+                    session._sidecar_structural_message_count = scanned_count
+                    session._loaded_metadata_only = True
+                    return session
                 # Cache miss → full-load. cls.load() itself populates the legacy
                 # facts cache with a TOCTOU-guarded write (expected_sig), so we
                 # do NOT re-cache here (an unguarded second write could stamp
                 # stale facts under a replacement file's signature — Codex r5).
                 return cls.load(sid)
+            # A non-positive or unusable sidecar header is not authority over a
+            # cache/index count.  Scan the actual array whenever the legacy
+            # facts-cache path above did not supply an authoritative full-load
+            # fact.  This is especially important for a modern malformed header
+            # paired with a stale positive index row: without this proof,
+            # compact() would preserve an arbitrary cached count instead of the
+            # structurally proven sidecar length.
+            if sidecar_message_count is None or sidecar_message_count == 0:
+                scanned_count = _scan_sidecar_message_count(p)
+                if scanned_count is not None:
+                    session._sidecar_structural_message_count = scanned_count
+                    session._loaded_metadata_only = True
+                    return session
             # Modern sidecars carry an accurate message_count, so it is the
             # source of truth and we skip the per-row _index.json read in the
             # common case. The sidebar index is only a cache (it can lag behind
@@ -1814,11 +2033,10 @@ class Session:
     def compact(self, include_runtime=False, active_stream_ids=None) -> dict:
         active_stream_ids = active_stream_ids if active_stream_ids is not None else set()
         has_pending_user_message = bool(self.pending_user_message)
-        message_count = (
-            self._metadata_message_count
-            if self._metadata_message_count is not None
-            else len(self.messages)
-        )
+        # WHY: metadata is only a fallback; a loaded non-empty sidecar must win
+        # so every save/index writer repairs (rather than persists) a stale or
+        # zero recovery snapshot.
+        message_count = _durable_message_count(self)
         if has_pending_user_message:
             message_count = max(message_count, 1)
         last_message_at = _last_message_timestamp(self.messages) or self.updated_at
@@ -1863,6 +2081,9 @@ class Session:
             'gateway_routing': self.gateway_routing,
             'gateway_routing_history': self.gateway_routing_history,
             'manual_title': self.manual_title,
+            # WHY: include generated-title state beside manual ownership so a
+            # compacted manually owned title is not mistaken as refresh-eligible.
+            'llm_title_generated': self.llm_title_generated,
             # Only emit 'parent_session_id' when set (the /branch fork link, #1342).
             # Sessions without a fork must not leak None — see test_session_lineage_metadata_api.
             **({'parent_session_id': self.parent_session_id} if self.parent_session_id else {}),
@@ -1899,6 +2120,53 @@ class Session:
                 self.active_stream_id, active_stream_ids
             ) if include_runtime else False,
         }
+
+
+def _durable_message_count(session) -> int:
+    """Return a sidebar count that cannot contradict a loaded sidecar.
+
+    WHY: recovery-created metadata-only objects can carry ``message_count=0``
+    (or no usable count at all) while the real sidecar has messages. Trusting
+    that stub alone let ``_write_session_index`` durably hide a non-empty chat.
+    A fully loaded sidecar is authoritative at its explicit truncation boundary,
+    so use its actual length whenever messages are present. For an empty
+    in-memory payload, retain a positive metadata count; if that count is
+    absent, malformed, or claims zero, make a bounded structural proof from the
+    sidecar itself. An absent/malformed header must never turn a metadata-only
+    load into a durable zero, while an actually empty array still proves zero.
+    This helper never consults state.db: replay permission remains owned by the
+    existing watermark-aware reconciler, so this ordering cannot resurrect an
+    intentionally deleted suffix.
+    """
+    messages = getattr(session, 'messages', None) or []
+    loaded_count = len(messages) if isinstance(messages, list) else 0
+    if loaded_count:
+        return loaded_count
+    scanned_count = getattr(session, '_sidecar_structural_message_count', None)
+    if scanned_count is not None:
+        # A scanner proof obtained by load_metadata_only() is tied to this stat
+        # snapshot and represents the sidecar itself.  It must outrank a cache
+        # count assembled from an absent/malformed/zero header.
+        return max(0, int(scanned_count))
+
+    metadata_count = getattr(session, '_metadata_message_count', None)
+    try:
+        parsed_count = max(0, int(metadata_count)) if metadata_count is not None else 0
+    except (TypeError, ValueError):
+        parsed_count = 0
+    if parsed_count:
+        return parsed_count
+
+    try:
+        path = session.path
+        if not path.exists():
+            # A new, unsaved session has no sidecar payload to prove; keep its
+            # genuine empty count at zero rather than creating a sidebar ghost.
+            return 0
+        scanned_count = _scan_sidecar_message_count(path)
+    except Exception:
+        scanned_count = None
+    return scanned_count if scanned_count is not None else 0
 
 
 PROCESS_WAKEUP_PROVIDER_UNAVAILABLE_TYPES = frozenset({
@@ -6353,6 +6621,85 @@ def _diag_stage(diag, name: str) -> None:
             pass
 
 
+def _materialize_index_update_from_state_db(session):
+    """Return an index update whose messages reflect replayable durable state.
+
+    WHY: a metadata-only recovery snapshot can reach a startup bulk index write
+    before the DB tail is materialized, durably persisting zero (or a stale
+    smaller count) and hiding a non-empty chat.  Full-load the sidecar first,
+    then use the existing append-only reconciler only when state.db is longer.
+    Its truncation-watermark/boundary rules remain authoritative, so an
+    intentionally deleted suffix is never resurrected for a larger raw DB count.
+    """
+    sid = getattr(session, 'session_id', None)
+    if not sid or not is_safe_session_id(sid):
+        return session
+
+    # The same discipline as the stale-stream reconciler: never block the whole
+    # sidebar on an active per-session writer. A later poll retries safely.
+    lock = _get_session_agent_lock(sid)
+    if not lock.acquire(blocking=False):
+        return session
+    try:
+        full = Session.load(sid)
+        if full is None:
+            return session
+        session = full
+        sidecar_count = _durable_message_count(session)
+
+        summary = get_state_db_session_summary(
+            sid,
+            profile=getattr(session, 'profile', None),
+        )
+        state_count = max(0, int(summary.get('message_count') or 0))
+        if state_count <= sidecar_count:
+            return session
+
+        state_messages = get_state_db_session_messages(
+            sid,
+            profile=getattr(session, 'profile', None),
+        )
+        if not state_messages:
+            return session
+        merged_messages = reconciled_state_db_messages_for_session(
+            session,
+            state_messages=state_messages,
+        )
+        if len(merged_messages) <= sidecar_count:
+            # WHY: raw DB rows greater than the sidecar is not permission to
+            # replay, and a smaller replay result must not replace a larger
+            # known sidecar snapshot. Keeping the durable maximum prevents both
+            # intentional-truncation resurrection and stale snapshot drift in
+            # the opposite direction.
+            return session
+        merged_context = reconciled_state_db_messages_for_session(
+            session,
+            prefer_context=True,
+            state_messages=state_messages,
+        )
+        session.messages = merged_messages
+        session.context_messages = merged_context
+        session.save(touch_updated_at=False)
+        logger.info(
+            "Materialized session index update %s from state.db (%d -> %d messages)",
+            sid,
+            sidecar_count,
+            len(merged_messages),
+        )
+        return session
+    except Exception:
+        # WHY: index recovery must never turn a transient DB/read failure into a
+        # sidebar outage; compact() still repairs a loaded non-empty sidecar.
+        logger.debug(
+            "Failed to materialize session index update from state.db for %s",
+            sid,
+            exc_info=True,
+        )
+        return session
+    finally:
+        lock.release()
+
+
 def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
     _diag_stage(diag, "all_sessions.active_streams")
     active_stream_ids = _active_stream_ids()
@@ -6393,6 +6740,10 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                     _diag_stage(diag, "all_sessions.backfill_load")
                     full = Session.load(s.get('session_id'))
                     if full:
+                        # WHY: materialize before compact/write so a DB tail
+                        # that arrived during recovery cannot persist a stale
+                        # or zero snapshot in the bulk backfill path.
+                        full = _materialize_index_update_from_state_db(full)
                         index[i] = full.compact()
                         backfilled.append(full)
             if backfilled:
@@ -6444,6 +6795,10 @@ def all_sessions(diag=None, *, include_lineage_metadata: bool = True):
                         sidecar = None
                     if not sidecar:
                         continue
+                    # WHY: missing-index recovery starts metadata-only; load and
+                    # reconcile the real tail before the bulk write so a known
+                    # non-empty sidecar/DB transcript cannot become zero.
+                    sidecar = _materialize_index_update_from_state_db(sidecar)
                     index_map[sidecar.session_id] = sidecar.compact(
                         include_runtime=True,
                         active_stream_ids=active_stream_ids,

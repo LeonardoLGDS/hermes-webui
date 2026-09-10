@@ -67,6 +67,9 @@ logger = logging.getLogger(__name__)
 _SESSION_LIST_RESPONSE_DEGRADED = ContextVar(
     "webui_session_list_response_degraded", default=False
 )
+_BOUNDED_SESSION_READ = ContextVar(
+    "webui_bounded_session_read", default=None
+)
 
 
 def _publish_session_list_changed(
@@ -124,6 +127,9 @@ def _persist_generated_session_title(
     *,
     event_reason: str,
     require_default_title: bool = False,
+    # WHY: only explicit user regeneration may force a write past ownership;
+    # automatic writers must not overwrite a manually set title.
+    force: bool = False,
 ) -> str:
     normalized_title = str(next_title or "").strip()[:80] or "Untitled"
     sid = str(getattr(session, "session_id", "") or "")
@@ -143,6 +149,12 @@ def _persist_generated_session_title(
         session = _ensure_full_session_before_mutation(sid, latest)
         if getattr(session, "read_only", False):
             raise PermissionError(f"Session {sid} is read-only")
+        from api.session_ops import session_has_manual_title
+
+        # WHY: block non-forced generated titles here to prevent an automatic
+        # writer from overwriting a manually owned title.
+        if session_has_manual_title(session) and not force:
+            return session.title
         if require_default_title:
             latest_meta = {
                 "title": getattr(session, "title", None),
@@ -13502,6 +13514,76 @@ def _render_index_shell_base() -> str:
 
 
 def handle_get(handler, parsed) -> bool:
+    return _handle_get_admitted(handler, parsed)
+
+
+def _bounded_initial_tail_request(parsed, query) -> bool:
+    """Recognize the exact tail/window requests this bounded path proves.
+
+    R73 extends the proven initial-tail contract to scroll-back windows.  The
+    live loader's first expansion is still a cumulative tail (no ``msg_before``);
+    once that reaches the 500-row ceiling it switches to ``msg_before`` paging.
+    Both shapes retain the same fail-closed eligibility rules: absent
+    ``messages`` intentionally remains equivalent to ``messages=1`` (the live
+    default), while metadata-only, malformed, and oversized requests stay on the
+    unchanged full-load admission path.
+    """
+    if parsed.path != "/api/session":
+        return False
+    if len(query.get("session_id", [])) != 1:
+        return False
+    messages = query.get("messages", ["1"])
+    if len(messages) != 1 or messages[0] != "1":
+        return False
+    # ``_parse_msg_limit`` deliberately clamps oversized values for response
+    # semantics. Admission eligibility must instead reject every non-exact
+    # integer outside 1..500 so malformed/oversized requests stay on full load.
+    if "msg_limit" not in query or len(query["msg_limit"]) != 1:
+        return False
+    raw_limit = query["msg_limit"][0]
+    if not re.fullmatch(r"[0-9]+", raw_limit or ""):
+        return False
+    try:
+        msg_limit = int(raw_limit)
+    except ValueError:
+        # WHY: Python's digit guard is also malformed-input handling.  Such a
+        # request must fall back to the old parser/gate path rather than 500.
+        return False
+    if not 1 <= msg_limit <= 500:
+        return False
+    # Even a malformed or zero msg_before changes pagination semantics and must
+    # retain the unchanged full admission path.  A positive exact integer is the
+    # one older-page shape for which the bounded suffix proof below is safe.
+    if "msg_before" in query:
+        if len(query["msg_before"]) != 1:
+            return False
+        raw_before = query["msg_before"][0]
+        if not re.fullmatch(r"[0-9]+", raw_before or ""):
+            return False
+        try:
+            msg_before = int(raw_before)
+        except ValueError:
+            # WHY: keep pathological digit strings on the unchanged full path;
+            # qualification itself must never turn into an unhandled 500.
+            return False
+        if msg_before <= 0:
+            return False
+    return True
+
+
+def _bounded_writer_authority_exists(sid: str) -> bool:
+    """Conservatively reject whenever a live/dirty writer might be authoritative."""
+    from api.config import session_writeback_owner
+
+    with LOCK:
+        if SESSIONS.get(sid) is not None:
+            return True
+    # A lingering writeback owner can have unsaved in-memory state even if its
+    # worker has already exited. Uncertainty is never bounded-read authority.
+    return session_writeback_owner(sid) is not None
+
+
+def _handle_get_admitted(handler, parsed) -> bool:
     """Admit expensive GETs before loading, compacting or redacting sessions."""
     if parsed.path == "/internal/memstats":
         from api.wsbound import RESPONSES, COMPILES, pressure_health
@@ -13517,6 +13599,12 @@ def handle_get(handler, parsed) -> bool:
                              claim_session_load, finish_session_load, join_session_load)
     from api.helpers import send_json_bytes, _json_response_body
     from api.profiles import get_active_profile_name, get_active_hermes_home
+    from api.bounded_session_tail import (
+        BOUNDED_GATE_COST,
+        BOUNDED_READ_UPPER,
+        BoundedTailUnsupported,
+        read_bounded_session_tail,
+    )
     query = parse_qs(parsed.query)
     metadata_only = (
         parsed.path == "/api/session"
@@ -13565,7 +13653,10 @@ def handle_get(handler, parsed) -> bool:
                     allow_degraded=True,
                 )
                 if cached_session is not None:
-                    list_payload_degraded = bool(list_payload.get("degraded"))
+                    # WHY: test_metadata_open_uses_fresh_list_cache_without_sidecar_read:
+                    # an unvalidated display response must never populate authority caches.
+                    list_payload_degraded = bool(list_payload.get("degraded")
+                        or cached_session.get("_metadata_response_degraded"))
 
                     def capture_metadata(body, status):
                         if (
@@ -13605,7 +13696,10 @@ def handle_get(handler, parsed) -> bool:
             flight.record(_json_response_body(payload), status)
         return j(handler, payload, status, extra_headers=extra_headers)
 
-    if parsed.path == "/api/session" and not metadata_only:
+    # WHY: bounded tails have their own fixed compile reservation and must not
+    # be shed by full-open flight exhaustion; reuse one shape decision below.
+    is_bounded_tail = _bounded_initial_tail_request(parsed, query)
+    if parsed.path == "/api/session" and not metadata_only and not is_bounded_tail:
         flight, is_flight_leader = claim_session_load(key)
         if flight is None:
             # WHY: unique-flight exhaustion is an abuse boundary. It must not
@@ -13646,64 +13740,134 @@ def handle_get(handler, parsed) -> bool:
                 return flight_json({"error": "poll_throttled"}, status=429,
                                    extra_headers={"Retry-After": str(retry)})
 
+        # WHY: R73 keeps the live admission ordering and boundary, but both
+        # bounded tail shapes (cumulative and msg_before) no longer pay the
+        # full-session expansion estimate.  The reservation is the reader's
+        # fixed 16 MiB structural upper bound * 12 plus its existing 1.5 MiB
+        # output allowance (202,899,456 bytes).  It covers the 8 MiB prefix
+        # proof, 4 MiB tail proof, and 4 MiB state proof independently of
+        # sidecar size, never enters Session.load/read_source_text, and only
+        # constructs a response-only derived Session.
+        #
+        # WHY: the proven live failure is a roughly 19.9 MB sidecar
+        # (15371642067b) whose unchanged full-load estimate is
+        # max(8MiB, size*2)*12 ~= 477MB; two such opens exceed the 512MiB gate.
+        # A valid initial msg_limit still cold-parsed that whole sidecar, and
+        # merely lowering the full gate would expose an unbounded load. This
+        # separate proof instead charges exactly 16MiB*12 + 1,572,864 =
+        # 202,899,456 and never enters Session.load/read_source_text.
+        if is_bounded_tail:
+            try:
+                # The bounded reservation is never nested or upgraded. An
+                # unsupported proof exits this with-block completely before the
+                # unchanged full cost below is acquired.
+                with COMPILES.admit(BOUNDED_GATE_COST):
+                    if path_stamp(session_path) != source:
+                        raise BoundedTailUnsupported("sidecar source changed")
+                    if _bounded_writer_authority_exists(sid):
+                        raise BoundedTailUnsupported("writer authority is active")
+                    read_token = READ_BUDGET.set(ReadBudget(BOUNDED_READ_UPPER))
+                    try:
+                        bounded = read_bounded_session_tail(
+                            sid,
+                            expected_source=source,
+                            # WHY: pass the exact accepted window to the bounded
+                            # reader.  The reader's fail-closed structural proof
+                            # supplies the complete supported array; the normal
+                            # response builder below applies msg_before without
+                            # inventing a second pagination implementation.
+                            msg_limit=int(query["msg_limit"][0]),
+                        )
+                        if _bounded_writer_authority_exists(sid):
+                            raise BoundedTailUnsupported("writer authority appeared")
+
+                        def bounded_capture(body, status):
+                            if (
+                                status == 200
+                                and path_stamp(session_path) == source
+                                and not _SESSION_LIST_RESPONSE_DEGRADED.get()
+                            ):
+                                RESPONSES.put(key, body, ttl=5)
+                            if flight is not None:
+                                flight.record(body, status)
+
+                        capture_token = RESPONSE_CAPTURE.set(bounded_capture)
+                        context_token = DERIVED_READ.set(True)
+                        bounded_token = _BOUNDED_SESSION_READ.set((sid, bounded))
+                        try:
+                            return _handle_get_impl(handler, parsed)
+                        finally:
+                            _BOUNDED_SESSION_READ.reset(bounded_token)
+                            DERIVED_READ.reset(context_token)
+                            RESPONSE_CAPTURE.reset(capture_token)
+                    finally:
+                        # WHY: response-builder reads also consume the bounded proof's read budget.
+                        READ_BUDGET.reset(read_token)
+            except BoundedTailUnsupported:
+                # This is intentionally outside the bounded with-block. The
+                # full path is the sole fallback and still pays its old cost.
+                pass
+
         # WHY: gate BEFORE get_session, not just serialization. A 12x expansion
         # estimate plus fixed DB/display allowance bounds concurrent legacy loads.
         read_bytes = max(8 * 1024 * 1024, source[2] * 2)
         cost = read_bytes * 12
         if parsed.path == "/api/sessions":
             cost = 128 * 1024 * 1024
-        try:
-            with COMPILES.admit(cost):
-                if path_stamp(session_path) != source:
-                    raise MemoryBudgetExceeded()
-                blob = RESPONSES.get(key)
-                if blob is not None:
-                    if flight is not None:
-                        flight.record(blob, 200)
-                    return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
-                def capture(body, status):
-                    if (
-                        status == 200
-                        and path_stamp(session_path) == source
-                        and not _SESSION_LIST_RESPONSE_DEGRADED.get()
-                    ):
-                        RESPONSES.put(key, body, ttl=5)
-                    if flight is not None:
-                        flight.record(body, status)
-                capture_token = RESPONSE_CAPTURE.set(capture)
-                context_token = DERIVED_READ.set(True)
-                read_token = READ_BUDGET.set(ReadBudget(read_bytes))
-                try:
-                    return _handle_get_impl(handler, parsed)
-                finally:
-                    RESPONSE_CAPTURE.reset(capture_token)
-                    DERIVED_READ.reset(context_token)
-                    READ_BUDGET.reset(read_token)
-        except MemoryBudgetExceeded:
-            if metadata_only:
-                if path_stamp(session_path) != source:
-                    return flight_json(
-                        {"error": "metadata_refresh_pending"},
-                        status=503,
-                        extra_headers={"Retry-After": "2"},
-                    )
-                return j(
-                    handler,
-                    _degraded_metadata_open_payload(
-                        sid,
-                        handler,
-                        get_active_profile_name(),
-                    ),
-                    extra_headers={"X-WebUI-Session-Metadata-Degraded": "1"},
+        # The bounded and full response builders share this outer exception
+        # boundary. In particular WindowTooLarge must reach the single 413
+        # mapping below whether the oversized row was found by either path.
+        with COMPILES.admit(cost):
+            if path_stamp(session_path) != source:
+                raise MemoryBudgetExceeded()
+            blob = RESPONSES.get(key)
+            if blob is not None:
+                if flight is not None:
+                    flight.record(blob, 200)
+                return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
+            def capture(body, status):
+                if (
+                    status == 200
+                    and path_stamp(session_path) == source
+                    and not _SESSION_LIST_RESPONSE_DEGRADED.get()
+                ):
+                    RESPONSES.put(key, body, ttl=5)
+                if flight is not None:
+                    flight.record(body, status)
+            capture_token = RESPONSE_CAPTURE.set(capture)
+            context_token = DERIVED_READ.set(True)
+            read_token = READ_BUDGET.set(ReadBudget(read_bytes))
+            try:
+                return _handle_get_impl(handler, parsed)
+            finally:
+                RESPONSE_CAPTURE.reset(capture_token)
+                DERIVED_READ.reset(context_token)
+                READ_BUDGET.reset(read_token)
+    except MemoryBudgetExceeded:
+        if metadata_only:
+            if path_stamp(session_path) != source:
+                return flight_json(
+                    {"error": "metadata_refresh_pending"},
+                    status=503,
+                    extra_headers={"Retry-After": "2"},
                 )
-            return flight_json({"error": "memory_budget"}, status=429,
-                                extra_headers={"Retry-After": "2"})
-        except SnapshotPending:
-            return flight_json({"error": "metadata_refresh_pending"}, status=503,
-                                extra_headers={"Retry-After": "2"})
-        except WindowTooLarge:
-            return flight_json({"error": "message_window_too_large", "max_bytes": 1572864},
-                               status=413)
+            return j(
+                handler,
+                _degraded_metadata_open_payload(
+                    sid,
+                    handler,
+                    get_active_profile_name(),
+                ),
+                extra_headers={"X-WebUI-Session-Metadata-Degraded": "1"},
+            )
+        return flight_json({"error": "memory_budget"}, status=429,
+                            extra_headers={"Retry-After": "2"})
+    except SnapshotPending:
+        return flight_json({"error": "metadata_refresh_pending"}, status=503,
+                           extra_headers={"Retry-After": "2"})
+    except WindowTooLarge:
+        return flight_json({"error": "message_window_too_large", "max_bytes": 1572864},
+                           status=413)
     finally:
         # WHY: claim/release wraps every leader path so an identical impatient
         # poll can never observe a stale registry entry after cancellation.
@@ -14346,7 +14510,27 @@ def _handle_get_impl(handler, parsed) -> bool:
         try:
             _t1 = _time.monotonic()
             if _diag: _diag.stage("t1_after_get_session_check")
-            s = get_session(sid, metadata_only=(not load_messages))
+            from api.wsbound import path_stamp
+            bounded_read = _BOUNDED_SESSION_READ.get()
+            bounded_contract = (
+                bounded_read[1]
+                if isinstance(bounded_read, tuple)
+                and len(bounded_read) == 2
+                and hasattr(bounded_read[1], "source_stamp")
+                else None
+            )
+            if (
+                isinstance(bounded_read, tuple)
+                and bounded_read[0] == sid
+                and bounded_contract is not None
+                and bounded_contract.source_stamp
+                == path_stamp(Path(SESSION_DIR) / f"{sid}.json")
+            ):
+                # WHY: R32 reached Session.load because the bounded producer's
+                # response-only Session was not bound into this display path.
+                s = bounded_contract.session
+            else:
+                s = get_session(sid, metadata_only=(not load_messages))
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
                 if _session_profile:
@@ -14370,6 +14554,13 @@ def _handle_get_impl(handler, parsed) -> bool:
             _clear_stale_stream_state(s)
             cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
             is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
+            bounded_read = _BOUNDED_SESSION_READ.get()
+            bounded_response = (
+                isinstance(bounded_read, tuple)
+                and bounded_read[0] == sid
+                and bounded_contract is not None
+                and bounded_contract.session is s
+            )
             cli_messages = []
             state_db_messages = []
             metadata_summary = None
@@ -14548,6 +14739,13 @@ def _handle_get_impl(handler, parsed) -> bool:
                 )
                 from api.wsbound import bounded_window
                 _truncated_msgs, _messages_offset = bounded_window(_truncated_msgs, _messages_offset)
+                if bounded_response:
+                    _messages_offset += bounded_contract.display_base_offset
+                # WHY: hidden tool rows do not consume msg_limit, so only the absolute raw-row ceiling may trim them.
+                if msg_limit is not None and len(_truncated_msgs) > _DISPLAY_WINDOW_ROW_LIMIT:
+                    excess_rows = len(_truncated_msgs) - _DISPLAY_WINDOW_ROW_LIMIT
+                    _truncated_msgs = _truncated_msgs[excess_rows:]
+                    _messages_offset += excess_rows
             else:
                 _truncated_msgs = []
                 _messages_offset = 0
@@ -14626,7 +14824,11 @@ def _handle_get_impl(handler, parsed) -> bool:
                     _messages_offset,
                     len(_truncated_msgs),
                 )
-            _merged_message_count = _summary_message_count if _summary_message_count is not None else len(_all_msgs)
+            _merged_message_count = (
+                bounded_contract.merged_message_count
+                if bounded_response
+                else _summary_message_count if _summary_message_count is not None else len(_all_msgs)
+            )
             _merged_last_message_at = _summary_last_message_at if _summary_last_message_at is not None else 0
             if _summary_last_message_at is None and _all_msgs:
                 try:
@@ -14658,6 +14860,9 @@ def _handle_get_impl(handler, parsed) -> bool:
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
             }
+            # WHY: the empty metadata stub is not an authoritative zero summary.
+            if not load_messages and compact_session.get('count_unavailable'):
+                raw['message_count'] = None
             if original_stream_id:
                 try:
                     journal = find_run_summary(original_stream_id)
@@ -16630,7 +16835,18 @@ def handle_post(handler, parsed) -> bool:
         next_title, reason, raw_preview = generate_session_title_for_session(s, prefer_latest=prefer_latest)
         if not next_title:
             return bad(handler, f"Could not generate a better title ({reason or 'empty'})", 422)
-        _persist_generated_session_title(s, next_title, event_reason="session_title_regenerate")
+        # WHY: capture manual ownership before forced regeneration so this user
+        # action cannot turn a manually owned title into an adaptive one.
+        had_manual_title = getattr(s, "manual_title", False) is True
+        _persist_generated_session_title(
+            s, next_title, event_reason="session_title_regenerate", force=True
+        )
+        if had_manual_title:
+            # WHY: explicit regeneration may replace text, but restoring (and
+            # persisting) ownership prevents later automatic title overwrites.
+            s.manual_title = True
+            s.llm_title_generated = False
+            s.save(touch_updated_at=False)
         return j(handler, {
             "session": s.compact(),
             "title": s.title,
