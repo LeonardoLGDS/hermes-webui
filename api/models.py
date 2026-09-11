@@ -186,6 +186,172 @@ def _safe_replace(src: Path, dst: Path) -> None:
             delay *= 2  # 50 -> 100 -> 200 -> 400 -> 800 ms
 
 
+_DRAFT_SIDECAR_VERSION = 1
+_DRAFT_SIDECAR_MAX_BYTES = 1024 * 1024
+
+
+def _draft_sidecar_path(sid: str) -> Path:
+    """Return the optional composer-draft path for a safe session id."""
+    # WHY: draft-save latency defect — keep the tiny draft outside the large transcript.
+    if not is_safe_session_id(sid):
+        raise ValueError(f"Unsafe session_id {sid!r}; refusing draft sidecar path")
+    return SESSION_DIR / f'{sid}.json.draft'
+
+
+def _write_draft_sidecar(sid: str, draft: dict) -> None:
+    """Durably replace the draft sidecar without touching the transcript."""
+    # WHY: draft-save latency defect — serialize only the composer, never all messages.
+    path = _draft_sidecar_path(sid)
+    payload = json.dumps(
+        {'version': _DRAFT_SIDECAR_VERSION, 'draft': draft},
+        ensure_ascii=False,
+        separators=(',', ':'),
+    )
+    tmp = path.with_suffix(
+        f'.draft.tmp.{os.getpid()}.{threading.current_thread().ident}'
+    )
+    replaced = False
+    try:
+        with open(tmp, 'w', encoding='utf-8') as sidecar_file:
+            sidecar_file.write(payload)
+            sidecar_file.flush()
+            os.fsync(sidecar_file.fileno())
+        _safe_replace(tmp, path)
+        replaced = True
+        if os.name != 'nt':
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    except Exception:
+        if not replaced:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def _load_composer_draft_sidecar(sid: str) -> dict | None:
+    """Return a strictly newer valid draft, or ``None`` for safe fallback."""
+    # WHY: draft-crash consistency — newer durable drafts win without blocking loads.
+    if not is_safe_session_id(sid):
+        return None
+    sidecar = _draft_sidecar_path(sid)
+    session_path = SESSION_DIR / f'{sid}.json'
+
+    def _stat_signature(path: Path):
+        stat_result = path.stat()
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    def _fd_stat_signature(stat_result):
+        return (
+            stat_result.st_dev,
+            stat_result.st_ino,
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+            stat_result.st_ctime_ns,
+        )
+
+    for _attempt in range(2):
+        try:
+            before_sidecar = _stat_signature(sidecar)
+            before_session = _stat_signature(session_path)
+            if before_sidecar[2] > _DRAFT_SIDECAR_MAX_BYTES:
+                raise ValueError(
+                    f"composer draft sidecar exceeds {_DRAFT_SIDECAR_MAX_BYTES} bytes"
+                )
+            if before_sidecar[3] <= before_session[3]:
+                return None
+            with sidecar.open("r", encoding="utf-8") as sidecar_file:
+                stat_before_read = os.fstat(sidecar_file.fileno())
+                if _fd_stat_signature(stat_before_read) != before_sidecar:
+                    continue
+                try:
+                    current_sidecar = sidecar.stat()
+                except OSError:
+                    continue
+                if _fd_stat_signature(current_sidecar) != before_sidecar:
+                    continue
+                raw = sidecar_file.read(_DRAFT_SIDECAR_MAX_BYTES + 1)
+                stat_after_read = os.fstat(sidecar_file.fileno())
+                if _fd_stat_signature(stat_after_read) != before_sidecar:
+                    continue
+                if len(raw) > _DRAFT_SIDECAR_MAX_BYTES:
+                    raise ValueError("composer draft sidecar grew beyond its bound")
+            payload = json.loads(raw)
+            if (
+                not isinstance(payload, dict)
+                or set(payload) != {'version', 'draft'}
+                or type(payload.get('version')) is not int
+                or payload.get('version') != _DRAFT_SIDECAR_VERSION
+                or not isinstance(payload.get('draft'), dict)
+            ):
+                raise ValueError('sidecar is not a version-1 draft envelope')
+            if (
+                _stat_signature(sidecar) != before_sidecar
+                or _stat_signature(session_path) != before_session
+            ):
+                continue
+            return payload['draft']
+        except FileNotFoundError:
+            return None
+        except Exception as exc:
+            logger.warning(
+                "Unusable composer draft sidecar for session %s (%s); "
+                "falling back to the session transcript draft",
+                sid,
+                exc,
+                exc_info=True,
+            )
+            return None
+    logger.warning(
+        "Composer draft sidecar for session %s changed during read; "
+        "falling back to the session transcript draft",
+        sid,
+    )
+    return None
+
+
+def _overlay_composer_draft_sidecar(session) -> None:
+    """Overlay the one durable draft authority onto any Session builder."""
+    sid = str(getattr(session, "session_id", "") or "")
+    if not sid:
+        return
+    sidecar_draft = _load_composer_draft_sidecar(sid)
+    if sidecar_draft is not None:
+        session.composer_draft = sidecar_draft
+
+
+def _composer_draft_overlay_value(sid: str, current) -> dict:
+    """Return the safe draft for dict-shaped, response-only builders."""
+    current = current if isinstance(current, dict) else {}
+    sidecar_draft = _load_composer_draft_sidecar(str(sid or ""))
+    return sidecar_draft if sidecar_draft is not None else current
+
+
+def _session_source_identity(path: Path):
+    """Return the full identity used to validate clean resident graphs."""
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
@@ -1529,6 +1695,14 @@ class Session:
         # Restored from persisted metadata on load (arrives via **kwargs).
         self.model_explicit_pick_signature = kwargs.get('model_explicit_pick_signature') or None
         self.messages = messages or []
+        # Constructors that materialize a full payload get a construction-time
+        # baseline. Load/save later installs the authoritative identity; legacy
+        # residents use this baseline to avoid re-reading an unchanged source.
+        self._construction_source_identity = (
+            _session_source_identity(SESSION_DIR / f"{self.session_id}.json")
+            if messages is not None
+            else None
+        )
         self.tool_calls = tool_calls or []
         self.created_at = created_at or time.time()
         self.updated_at = updated_at or time.time()
@@ -1601,6 +1775,9 @@ class Session:
         self.process_wakeup_pause = process_wakeup_pause if isinstance(process_wakeup_pause, dict) else {}
         self.share_token = str(share_token).strip() if share_token else None
         self.share_created_at = share_created_at
+        # Clean resident reads may use this only after a stable load/save. Dirty
+        # writer state remains authoritative without a disk identity check.
+        self._source_identity = None
         # #5854: a compact fingerprint of anchor_activity_scenes ({scene_key:
         # updated_at}) persisted BEFORE the messages array so the sidebar-poll
         # freshness check can compare scene freshness without parsing the full
@@ -1621,6 +1798,21 @@ class Session:
     @property
     def path(self):
         return SESSION_DIR / f'{self.session_id}.json'
+
+    def save_composer_draft(self, draft: dict) -> None:
+        """Persist only the composer draft and never the message transcript."""
+        # WHY: draft-save latency defect — adopt the draft only after its durable write.
+        if not isinstance(draft, dict):
+            raise TypeError("composer draft must be a JSON object")
+        if not self.path.exists() and not (self.messages or []):
+            # WHY: draft-save latency defect — keep new-chat drafts restart-durable.
+            previous_draft = self.composer_draft
+            self.composer_draft = copy.deepcopy(draft)
+            try:
+                self.save(touch_updated_at=False, skip_index=True)
+            finally:
+                self.composer_draft = previous_draft
+        _write_draft_sidecar(self.session_id, copy.deepcopy(draft))
 
     def save(self, touch_updated_at: bool = True, skip_index: bool = False) -> None:
         if not is_safe_session_id(self.session_id):
@@ -1798,6 +1990,7 @@ class Session:
             except Exception:
                 pass
             raise
+        self._source_identity = _session_source_identity(self.path)
         if replay_rows_removed:
             self.messages = messages_to_persist
         if not skip_index:
@@ -1841,10 +2034,18 @@ class Session:
         # cache write is only committed if the file didn't change under us
         # during the parse (TOCTOU guard against an atomic replace mid-read).
         _pre_read_sig = _sidecar_stat_signature(p)
+        _pre_source_identity = _session_source_identity(p)
         from api.wsbound import read_source_text
         data = json.loads(read_source_text(p))
+        if _session_source_identity(p) != _pre_source_identity:
+            from api.wsbound import MemoryBudgetExceeded
+
+            raise MemoryBudgetExceeded()
         data['messages'], _collapsed_partials = _collapse_adjacent_duplicate_partials(data.get('messages'))
         session = cls(**data)
+        # WHY: draft-save latency defect — overlay newer drafts after transcript parsing.
+        _overlay_composer_draft_sidecar(session)
+        session._source_identity = _pre_source_identity
         if _collapsed_partials:
             try:
                 # Self-heal bloated sessions on first full load without touching
@@ -1936,6 +2137,7 @@ class Session:
                     session = cls(**parsed)
                     session._metadata_message_count = _parse_nonnegative_int(_facts.get('message_count'))
                     session._loaded_metadata_only = True
+                    _overlay_composer_draft_sidecar(session)
                     return session
                 # WHY: both a genuinely empty array and a non-empty array can
                 # reach this metadata-only stub with no usable header.  A full
@@ -1952,6 +2154,7 @@ class Session:
                     # sentinel without a second prefix read.
                     session._sidecar_structural_message_count = scanned_count
                     session._loaded_metadata_only = True
+                    _overlay_composer_draft_sidecar(session)
                     return session
                 # Cache miss → full-load. cls.load() itself populates the legacy
                 # facts cache with a TOCTOU-guarded write (expected_sig), so we
@@ -1970,6 +2173,7 @@ class Session:
                 if scanned_count is not None:
                     session._sidecar_structural_message_count = scanned_count
                     session._loaded_metadata_only = True
+                    _overlay_composer_draft_sidecar(session)
                     return session
             # Modern sidecars carry an accurate message_count, so it is the
             # source of truth and we skip the per-row _index.json read in the
@@ -1989,6 +2193,7 @@ class Session:
             # session must reload it with metadata_only=False first.
             # See #1558 — v0.50.279 _clear_stale_stream_state() data-loss bug.
             session._loaded_metadata_only = True
+            _overlay_composer_draft_sidecar(session)
             return session
         except Exception:
             # Corrupt prefix or decode error — fall back to full load

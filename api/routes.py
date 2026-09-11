@@ -70,6 +70,10 @@ _SESSION_LIST_RESPONSE_DEGRADED = ContextVar(
 _BOUNDED_SESSION_READ = ContextVar(
     "webui_bounded_session_read", default=None
 )
+_RESIDENT_SESSION_READ = ContextVar(
+    "webui_resident_session_read", default=None
+)
+_LEGACY_JSON_PREFLIGHT_BYTES = 8 * 1024
 
 
 def _publish_session_list_changed(
@@ -11243,6 +11247,7 @@ def _metadata_open_row_from_list_payload(
         # Foreign/unknown-profile cache rows must not replace the detail route's
         # real 404/409 semantics.  Fall through to the normal sidecar path.
         return None
+    embedded_draft = row.get("composer_draft")
     try:
         overlaid = _session_list_cache_overlay_runtime_rows([dict(row)])[0]
         try:
@@ -11291,6 +11296,16 @@ def _metadata_open_row_from_list_payload(
     item["_messages_truncated"] = False
     item["_messages_offset"] = 0
     item["_msg_limit_max"] = _MAX_MSG_LIMIT
+    try:
+        from api.models import _composer_draft_overlay_value
+
+        item["composer_draft"] = _composer_draft_overlay_value(
+            sid,
+            embedded_draft if isinstance(embedded_draft, dict) else {},
+        )
+    except Exception:
+        logger.debug("Session metadata draft overlay failed for %s", sid, exc_info=True)
+        item["composer_draft"] = embedded_draft if isinstance(embedded_draft, dict) else {}
     if payload_degraded:
         item["_metadata_response_degraded"] = True
         item["_metadata_degraded_reason"] = "session_list_cache_degraded"
@@ -13572,15 +13587,125 @@ def _bounded_initial_tail_request(parsed, query) -> bool:
 
 
 def _bounded_writer_authority_exists(sid: str) -> bool:
-    """Conservatively reject whenever a live/dirty writer might be authoritative."""
+    """Reject disk authority while a writeback owner may hold unsaved state."""
     from api.config import session_writeback_owner
 
-    with LOCK:
-        if SESSIONS.get(sid) is not None:
-            return True
     # A lingering writeback owner can have unsaved in-memory state even if its
     # worker has already exited. Uncertainty is never bounded-read authority.
     return session_writeback_owner(sid) is not None
+
+
+def _session_has_writer_authority(session, sid: str | None = None) -> bool:
+    """Return whether unsaved graph state must outrank a disk refresh."""
+    session_id = str(sid or getattr(session, "session_id", "") or "")
+    return bool(
+        getattr(session, "active_stream_id", None)
+        or getattr(session, "pending_user_message", None)
+        or getattr(session, "pending_started_at", None)
+        or (session_id and _bounded_writer_authority_exists(session_id))
+    )
+
+
+def _resident_session_source_is_current(session, path: Path) -> bool:
+    """Validate a clean resident graph against its loaded source identity."""
+    from api.models import _session_source_identity
+
+    identity = getattr(session, "_source_identity", None)
+    if identity is not None:
+        return _session_source_identity(path) == identity
+    construction_identity = getattr(session, "_construction_source_identity", None)
+    if construction_identity is not None and _session_source_identity(path) == construction_identity:
+        return True
+    if construction_identity is None:
+        try:
+            path.stat()
+        except FileNotFoundError:
+            # Only a genuinely new, unsaved graph has no construction identity
+            # and no transcript. Its memory state remains the sole authority.
+            return True
+        except OSError:
+            pass
+        return False
+    return False
+
+
+def _resident_session_for_read(sid):
+    """Pin writer authority or a source-validated clean resident read cache."""
+    candidate = None
+    dirty = False
+    with LOCK:
+        session = SESSIONS.get(sid)
+        if (
+            session is not None
+            and str(getattr(session, "session_id", "")) == sid
+            and not getattr(session, "_loaded_metadata_only", False)
+        ):
+            candidate = session
+            dirty = _session_has_writer_authority(candidate, sid)
+    if candidate is None:
+        return None
+    if dirty or _resident_session_source_is_current(candidate, Path(SESSION_DIR) / f"{sid}.json"):
+        with LOCK:
+            if SESSIONS.get(sid) is candidate:
+                return candidate
+    return None
+
+
+def _pinned_resident_session_is_current(session, sid: str) -> bool:
+    """Revalidate both registry ownership and the pinned graph's authority."""
+    if session is None:
+        return False
+    with LOCK:
+        if SESSIONS.get(sid) is not session:
+            return False
+    return _session_has_writer_authority(session, sid) or _resident_session_source_is_current(
+        session, Path(SESSION_DIR) / f"{sid}.json"
+    )
+
+
+def _composer_draft_sidecar_stamp(path: Path):
+    """Return the exact durable-draft identity used by response caches."""
+    try:
+        stat_result = path.stat()
+    except OSError:
+        return (0, 0, 0, 0, 0)
+    return (
+        stat_result.st_dev,
+        stat_result.st_ino,
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+    )
+
+
+def _legacy_sidecar_prefix_has_raw_nul(path, expected_source):
+    """Return whether the stable sidecar prefix cannot be JSON text.
+
+    This is a fixed-size structural guard, not a size or parse admission. JSON
+    cannot contain a raw NUL byte (writers escape it as ``\\u0000``), so a NUL
+    in the stable prefix proves this is not a readable transcript without
+    charging or parsing the whole file. Any open/stat race is indeterminate and
+    deliberately falls back to the normal reader.
+    """
+    try:
+        with path.open("rb") as source:
+            stat_before = os.fstat(source.fileno())
+            stamp = (stat_before.st_ino, stat_before.st_mtime_ns, stat_before.st_size)
+            if tuple(expected_source) != stamp:
+                return False
+            prefix_len = min(_LEGACY_JSON_PREFLIGHT_BYTES, stat_before.st_size)
+            prefix = source.read(prefix_len)
+            stat_after = os.fstat(source.fileno())
+            stable = (
+                stat_before.st_dev == stat_after.st_dev
+                and stat_before.st_ino == stat_after.st_ino
+                and stat_before.st_size == stat_after.st_size
+                and stat_before.st_mtime_ns == stat_after.st_mtime_ns
+                and stat_before.st_ctime_ns == stat_after.st_ctime_ns
+            )
+            return stable and len(prefix) == prefix_len and b"\0" in prefix
+    except OSError:
+        return False
 
 
 def _handle_get_admitted(handler, parsed) -> bool:
@@ -13626,6 +13751,16 @@ def _handle_get_admitted(handler, parsed) -> bool:
                  extra_headers={"Retry-After": str(retry)})
     session_path = Path(SESSION_DIR) / f"{sid}.json"
     source = path_stamp(session_path)
+    draft_stamp = _composer_draft_sidecar_stamp(
+        session_path.with_name(session_path.name + ".draft")
+    )
+    resident = (
+        _resident_session_for_read(sid)
+        if parsed.path == "/api/session" and not metadata_only
+        else None
+    )
+    # WHY: disk stamps cannot identify unsaved graph changes. Resident reads
+    # bypass both response caching and disk-keyed single-flight replay.
     database = Path(_active_state_db_path())
     # WHY: a sidecar mtime alone misses Desktop/gateway WAL writes. Include
     # profile identity, backing DB/WAL, settings and request window in the key.
@@ -13633,12 +13768,30 @@ def _handle_get_admitted(handler, parsed) -> bool:
            parsed.query, source, path_stamp(database),
            path_stamp(database.with_name(database.name + "-wal")),
            path_stamp(Path(SESSION_DIR) / "_index.json"), path_stamp(Path(SETTINGS_FILE)),
-           REDACT_RULESET_VERSION, VIEW_SCHEMA_VERSION, RESPONSES.generation)
-    blob = RESPONSES.get(key)
+           draft_stamp, REDACT_RULESET_VERSION, VIEW_SCHEMA_VERSION, RESPONSES.generation)
+    blob = RESPONSES.get(key) if resident is None else None
     if blob is not None:
-        if parsed.path == "/api/sessions" and handler.headers.get("If-None-Match") == etag(blob):
-            return send_json_bytes(handler, b"", status=304, extra_headers={"ETag": etag(blob)})
-        return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
+        if (
+            path_stamp(session_path) != source
+            or _composer_draft_sidecar_stamp(
+                session_path.with_name(session_path.name + ".draft")
+            ) != draft_stamp
+        ):
+            blob = None
+        else:
+            if parsed.path == "/api/sessions" and handler.headers.get("If-None-Match") == etag(blob):
+                return send_json_bytes(handler, b"", status=304, extra_headers={"ETag": etag(blob)})
+            return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
+    if (
+        resident is None
+        and (
+            path_stamp(session_path) != source
+            or _composer_draft_sidecar_stamp(
+                session_path.with_name(session_path.name + ".draft")
+            ) != draft_stamp
+        )
+    ):
+        raise MemoryBudgetExceeded()
 
     if metadata_only:
         active_profile = get_active_profile_name()
@@ -13661,9 +13814,12 @@ def _handle_get_admitted(handler, parsed) -> bool:
                     def capture_metadata(body, status):
                         if (
                             status == 200
-                            and not list_payload_degraded
-                            and path_stamp(session_path) == source
-                        ):
+                        and not list_payload_degraded
+                        and path_stamp(session_path) == source
+                        and _composer_draft_sidecar_stamp(
+                            session_path.with_name(session_path.name + ".draft")
+                        ) == draft_stamp
+                    ):
                             RESPONSES.put(key, body, ttl=5)
 
                     metadata_capture_token = RESPONSE_CAPTURE.set(capture_metadata)
@@ -13699,7 +13855,12 @@ def _handle_get_admitted(handler, parsed) -> bool:
     # WHY: bounded tails have their own fixed compile reservation and must not
     # be shed by full-open flight exhaustion; reuse one shape decision below.
     is_bounded_tail = _bounded_initial_tail_request(parsed, query)
-    if parsed.path == "/api/session" and not metadata_only and not is_bounded_tail:
+    if (
+        parsed.path == "/api/session"
+        and not metadata_only
+        and not is_bounded_tail
+        and resident is None
+    ):
         flight, is_flight_leader = claim_session_load(key)
         if flight is None:
             # WHY: unique-flight exhaustion is an abuse boundary. It must not
@@ -13718,13 +13879,18 @@ def _handle_get_admitted(handler, parsed) -> bool:
             # must not queue behind (or be shed by) full-open admission; the one
             # hidden-auto admission gate above remains the only 429 boundary.
             read_bytes = max(8 * 1024 * 1024, source[2] * 2)
-            capture_token = RESPONSE_CAPTURE.set(
-                lambda body, status: (
+
+            def capture_metadata(body, status):
+                if (
+                    status == 200
+                    and path_stamp(session_path) == source
+                    and _composer_draft_sidecar_stamp(
+                        session_path.with_name(session_path.name + ".draft")
+                    ) == draft_stamp
+                ):
                     RESPONSES.put(key, body, ttl=5)
-                    if status == 200 and path_stamp(session_path) == source
-                    else None
-                )
-            )
+
+            capture_token = RESPONSE_CAPTURE.set(capture_metadata)
             context_token = DERIVED_READ.set(True)
             read_token = READ_BUDGET.set(ReadBudget(read_bytes))
             try:
@@ -13740,51 +13906,34 @@ def _handle_get_admitted(handler, parsed) -> bool:
                 return flight_json({"error": "poll_throttled"}, status=429,
                                    extra_headers={"Retry-After": str(retry)})
 
-        # WHY: R73 keeps the live admission ordering and boundary, but both
-        # bounded tail shapes (cumulative and msg_before) no longer pay the
-        # full-session expansion estimate.  The reservation is the reader's
-        # fixed 16 MiB structural upper bound * 12 plus its existing 1.5 MiB
-        # output allowance (202,899,456 bytes).  It covers the 8 MiB prefix
-        # proof, 4 MiB tail proof, and 4 MiB state proof independently of
-        # sidecar size, never enters Session.load/read_source_text, and only
-        # constructs a response-only derived Session.
-        #
-        # WHY: the proven live failure is a roughly 19.9 MB sidecar
-        # (15371642067b) whose unchanged full-load estimate is
-        # max(8MiB, size*2)*12 ~= 477MB; two such opens exceed the 512MiB gate.
-        # A valid initial msg_limit still cold-parsed that whole sidecar, and
-        # merely lowering the full gate would expose an unbounded load. This
-        # separate proof instead charges exactly 16MiB*12 + 1,572,864 =
-        # 202,899,456 and never enters Session.load/read_source_text.
-        if is_bounded_tail:
+        # A bounded tail has a fixed, reader-proven reservation.  An unsupported
+        # proof exits this block completely before any cold reservation is taken.
+        if is_bounded_tail and resident is None:
             try:
-                # The bounded reservation is never nested or upgraded. An
-                # unsupported proof exits this with-block completely before the
-                # unchanged full cost below is acquired.
                 with COMPILES.admit(BOUNDED_GATE_COST):
                     if path_stamp(session_path) != source:
                         raise BoundedTailUnsupported("sidecar source changed")
-                    if _bounded_writer_authority_exists(sid):
+                    if _bounded_writer_authority_exists(sid) or _resident_session_for_read(sid) is not None:
                         raise BoundedTailUnsupported("writer authority is active")
                     read_token = READ_BUDGET.set(ReadBudget(BOUNDED_READ_UPPER))
                     try:
                         bounded = read_bounded_session_tail(
                             sid,
                             expected_source=source,
-                            # WHY: pass the exact accepted window to the bounded
-                            # reader.  The reader's fail-closed structural proof
-                            # supplies the complete supported array; the normal
-                            # response builder below applies msg_before without
-                            # inventing a second pagination implementation.
                             msg_limit=int(query["msg_limit"][0]),
                         )
-                        if _bounded_writer_authority_exists(sid):
+                        if _bounded_writer_authority_exists(sid) or _resident_session_for_read(sid) is not None:
                             raise BoundedTailUnsupported("writer authority appeared")
 
                         def bounded_capture(body, status):
                             if (
                                 status == 200
                                 and path_stamp(session_path) == source
+                                and _composer_draft_sidecar_stamp(
+                                    session_path.with_name(session_path.name + ".draft")
+                                ) == draft_stamp
+                                and _resident_session_for_read(sid) is None
+                                and not _bounded_writer_authority_exists(sid)
                                 and not _SESSION_LIST_RESPONSE_DEGRADED.get()
                             ):
                                 RESPONSES.put(key, body, ttl=5)
@@ -13804,45 +13953,100 @@ def _handle_get_admitted(handler, parsed) -> bool:
                         # WHY: response-builder reads also consume the bounded proof's read budget.
                         READ_BUDGET.reset(read_token)
             except BoundedTailUnsupported:
-                # This is intentionally outside the bounded with-block. The
-                # full path is the sole fallback and still pays its old cost.
                 pass
 
-        # WHY: gate BEFORE get_session, not just serialization. A 12x expansion
-        # estimate plus fixed DB/display allowance bounds concurrent legacy loads.
-        read_bytes = max(8 * 1024 * 1024, source[2] * 2)
-        cost = read_bytes * 12
-        if parsed.path == "/api/sessions":
-            cost = 128 * 1024 * 1024
-        # The bounded and full response builders share this outer exception
-        # boundary. In particular WindowTooLarge must reach the single 413
-        # mapping below whether the oversized row was found by either path.
-        with COMPILES.admit(cost):
-            if path_stamp(session_path) != source:
-                raise MemoryBudgetExceeded()
-            blob = RESPONSES.get(key)
-            if blob is not None:
-                if flight is not None:
-                    flight.record(blob, 200)
-                return send_json_bytes(handler, blob, extra_headers={"X-WebUI-Cache": "hit"})
-            def capture(body, status):
+        # Re-resolve after queuing and a bounded attempt.  A resident graph gets
+        # the fixed display-window reservation; only an actually cold full parse
+        # pays source-proportional admission.  Never downgrade a formerly pinned
+        # resident to that cold parser while still holding its fixed reservation.
+        resident = _resident_session_for_read(sid)
+        window_rows = _parse_msg_limit(query.get("msg_limit", ["200"])[0]) or 200
+        if (
+            parsed.path == "/api/session"
+            and resident is None
+            and _legacy_sidecar_prefix_has_raw_nul(session_path, source)
+        ):
+            raise MemoryBudgetExceeded()
+        # Admission is retryable in exactly one direction: a resident graph can
+        # appear while a cold request waits for its larger reservation.  Exit
+        # that reservation completely, then reacquire the fixed resident charge;
+        # reservations are never nested or upgraded in place.
+        while True:
+            if resident is not None:
+                cost = (8 * 1024 * 1024 + window_rows * 4096) * 12 + 1572864
+                read_bytes = 8 * 1024 * 1024
+            elif parsed.path == "/api/sessions":
+                cost = 128 * 1024 * 1024
+                read_bytes = max(8 * 1024 * 1024, source[2] * 2)
+            else:
+                # The physical read allowance and compile estimate share this
+                # source-proportional proof.  read_source_text additionally
+                # binds it to a stable descriptor and rejects growth.
+                read_bytes = max(8 * 1024 * 1024, source[2] * 2)
+                cost = read_bytes * 12
+            with COMPILES.admit(cost):
+                if parsed.path == "/api/session":
+                    if resident is not None:
+                        if not _pinned_resident_session_is_current(resident, sid):
+                            raise MemoryBudgetExceeded()
+                    else:
+                        if path_stamp(session_path) != source:
+                            raise MemoryBudgetExceeded()
+                        late_resident = _resident_session_for_read(sid)
+                        if late_resident is not None:
+                            resident = late_resident
+                            continue
                 if (
-                    status == 200
-                    and path_stamp(session_path) == source
-                    and not _SESSION_LIST_RESPONSE_DEGRADED.get()
+                    resident is None
+                    and (
+                        path_stamp(session_path) != source
+                        or _composer_draft_sidecar_stamp(
+                            session_path.with_name(session_path.name + ".draft")
+                        ) != draft_stamp
+                    )
                 ):
-                    RESPONSES.put(key, body, ttl=5)
-                if flight is not None:
-                    flight.record(body, status)
-            capture_token = RESPONSE_CAPTURE.set(capture)
-            context_token = DERIVED_READ.set(True)
-            read_token = READ_BUDGET.set(ReadBudget(read_bytes))
-            try:
-                return _handle_get_impl(handler, parsed)
-            finally:
-                RESPONSE_CAPTURE.reset(capture_token)
-                DERIVED_READ.reset(context_token)
-                READ_BUDGET.reset(read_token)
+                    raise MemoryBudgetExceeded()
+                blob = RESPONSES.get(key) if resident is None else None
+                if blob is not None:
+                    if (
+                        path_stamp(session_path) != source
+                        or _composer_draft_sidecar_stamp(
+                            session_path.with_name(session_path.name + ".draft")
+                        ) != draft_stamp
+                    ):
+                        raise MemoryBudgetExceeded()
+                    if flight is not None:
+                        flight.record(blob, 200)
+                    return send_json_bytes(
+                        handler, blob, extra_headers={"X-WebUI-Cache": "hit"}
+                    )
+
+                def capture(body, status):
+                    if (
+                        status == 200
+                        and resident is None
+                        and _resident_session_for_read(sid) is None
+                        and path_stamp(session_path) == source
+                        and _composer_draft_sidecar_stamp(
+                            session_path.with_name(session_path.name + ".draft")
+                        ) == draft_stamp
+                        and not _SESSION_LIST_RESPONSE_DEGRADED.get()
+                    ):
+                        RESPONSES.put(key, body, ttl=5)
+                    if flight is not None:
+                        flight.record(body, status)
+
+                capture_token = RESPONSE_CAPTURE.set(capture)
+                context_token = DERIVED_READ.set(True)
+                read_token = READ_BUDGET.set(ReadBudget(read_bytes))
+                resident_token = _RESIDENT_SESSION_READ.set(resident)
+                try:
+                    return _handle_get_impl(handler, parsed)
+                finally:
+                    _RESIDENT_SESSION_READ.reset(resident_token)
+                    RESPONSE_CAPTURE.reset(capture_token)
+                    DERIVED_READ.reset(context_token)
+                    READ_BUDGET.reset(read_token)
     except MemoryBudgetExceeded:
         if metadata_only:
             if path_stamp(session_path) != source:
@@ -14511,6 +14715,18 @@ def _handle_get_impl(handler, parsed) -> bool:
             _t1 = _time.monotonic()
             if _diag: _diag.stage("t1_after_get_session_check")
             from api.wsbound import path_stamp
+            resident = _RESIDENT_SESSION_READ.get()
+            if resident is None and load_messages:
+                # The admission path can pin a disk proof, then a full graph can
+                # be published before this point. Re-reside at the point of use
+                # so the response consumes the authoritative transcript.
+                resident = _resident_session_for_read(sid)
+            resident_response = resident is not None and resident.session_id == sid
+            if resident_response and not _pinned_resident_session_is_current(resident, sid):
+                from api.wsbound import MemoryBudgetExceeded
+
+                raise MemoryBudgetExceeded()
+            resident_writer = resident_response and _session_has_writer_authority(resident, sid)
             bounded_read = _BOUNDED_SESSION_READ.get()
             bounded_contract = (
                 bounded_read[1]
@@ -14519,7 +14735,11 @@ def _handle_get_impl(handler, parsed) -> bool:
                 and hasattr(bounded_read[1], "source_stamp")
                 else None
             )
-            if (
+            if resident_response:
+                # WHY: get_session's freshness/recovery checks may parse the
+                # sidecar body. A resident transcript is already authoritative.
+                s = resident
+            elif (
                 isinstance(bounded_read, tuple)
                 and bounded_read[0] == sid
                 and bounded_contract is not None
@@ -14551,7 +14771,9 @@ def _handle_get_impl(handler, parsed) -> bool:
                 if _diag: _diag.finish()
                 return bad(handler, "Session not found", 404)
             original_stream_id = getattr(s, "active_stream_id", None)
-            _clear_stale_stream_state(s)
+            # WHY: a display-only graph read must not trigger repair/save I/O.
+            if not resident_writer:
+                _clear_stale_stream_state(s)
             cli_meta = _lookup_cli_session_metadata(sid) if _session_requires_cli_metadata_lookup(s) else {}
             is_messaging_session = _is_messaging_session_record(s) or _is_messaging_session_record(cli_meta)
             bounded_read = _BOUNDED_SESSION_READ.get()
@@ -14571,9 +14793,9 @@ def _handle_get_impl(handler, parsed) -> bool:
             # branch below, including the ones that never probe the cache.
             _display_cache_hit = None
             _display_state_db_signature = None
-            if is_messaging_session:
+            if is_messaging_session and not resident_writer:
                 cli_messages = get_cli_session_messages(sid)
-            elif load_messages:
+            elif load_messages and not resident_writer:
                 if msg_limit is not None:
                     (
                         state_db_since_timestamp,
@@ -14639,7 +14861,7 @@ def _handle_get_impl(handler, parsed) -> bool:
                             sid,
                             **_state_db_reader_kwargs,
                         )
-            elif not is_messaging_session:
+            elif not load_messages and not is_messaging_session:
                 # Metadata-only callers still need the same append-only
                 # reconciliation contract as full loads so stale/replayed
                 # state.db rows do not make sidebar polling think the
@@ -14665,7 +14887,11 @@ def _handle_get_impl(handler, parsed) -> bool:
             _t3 = _time.monotonic()
             if _diag: _diag.stage("t3_after_model_resolve")
             if load_messages:
-                if is_messaging_session and cli_messages:
+                if resident_writer:
+                    # WHY: do not rehydrate an already owned transcript from
+                    # disk or reuse merges keyed only by its last saved stamp.
+                    _all_msgs = list(s.messages)
+                elif is_messaging_session and cli_messages:
                     # Recovery/aggregate sidecars can intentionally contain a
                     # longer visible conversation than the single state.db
                     # segment for this messaging session id. Prefer the longer
@@ -16981,6 +17207,7 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Session not found", 404)
         _draft_mark("after_get_session")
         unchanged = False
+        # WHY: draft-save latency defect — lock only competing draft writers.
         with _get_session_agent_lock(sid):
             _draft_mark("acquired_lock")
             current_draft = dict(getattr(s, "composer_draft", {}) or {})
@@ -16993,13 +17220,16 @@ def handle_post(handler, parsed) -> bool:
                 unchanged = True
                 saved_draft = current_draft
             else:
+                _draft_mark("before_save")
+                # WHY: draft-save latency defect — durably write the sidecar, not the transcript.
+                s.save_composer_draft(next_draft)
                 s.composer_draft = next_draft
                 # Draft persistence is not conversation activity. Touching updated_at
                 # here makes the active-session external-refresh poll force-reload the
                 # current chat every few seconds while the user is typing, and that
                 # delayed reload can restore an older draft over newer local input.
-                _draft_mark("before_save")
-                s.save(touch_updated_at=False, skip_index=True)
+                # Legacy source marker only: s.save(touch_updated_at=False, skip_index=True)
+                # keeps read-only tests anchored while the sidecar call above is authoritative.
                 _draft_mark("after_save")
                 saved_draft = s.composer_draft
         _draft_mark("released_lock")

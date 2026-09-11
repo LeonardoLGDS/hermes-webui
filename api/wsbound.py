@@ -53,7 +53,27 @@ def read_source_text(path):
         raw = source.read(budget.remaining + 1)
         after = os.fstat(source.fileno())
         budget.consume(len(raw))
-        if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        descriptor_identity = (
+            before.st_dev, before.st_ino, before.st_size,
+            before.st_mtime_ns, before.st_ctime_ns,
+        )
+        if descriptor_identity != (
+            after.st_dev, after.st_ino, after.st_size,
+            after.st_mtime_ns, after.st_ctime_ns,
+        ):
+            raise MemoryBudgetExceeded()
+        # An atomic replacement can race the path lookup/open or happen after a
+        # stable descriptor read. Comparing the live name to the descriptor in
+        # both directions prevents stamping content from one inode with another
+        # inode's source identity.
+        try:
+            current = path.stat()
+        except OSError:
+            raise MemoryBudgetExceeded() from None
+        if descriptor_identity != (
+            current.st_dev, current.st_ino, current.st_size,
+            current.st_mtime_ns, current.st_ctime_ns,
+        ):
             raise MemoryBudgetExceeded()
     return raw.decode("utf-8")
 

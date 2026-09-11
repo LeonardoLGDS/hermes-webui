@@ -17,10 +17,14 @@ The LRU has a 256 MiB default cap, counts key/entry overhead, and rejects entrie
 larger than one quarter of its cap. `HERMES_WEBUI_CACHE_BYTES` overrides the cap.
 `HERMES_WEBUI_INFLIGHT_BYTES` overrides the 512 MiB compile budget. The gate admits
 at most two compiles and 64 queued requests, FIFO, with a two-second deadline.
-Failures return `429 memory_budget` and `Retry-After: 2`; no unbounded fallback.
-Each request reserves twelve times a raw-input allowance of at least 8 MiB or
-twice its sidecar size (sidecar plus DB merge). This multiplier is an estimate,
-not a proof of a universal Python-object expansion ratio or a process RSS cap.
+Gate contention returns `429 memory_budget` and `Retry-After: 2`; no unbounded
+fallback. Clean initial/window reads use the fixed bounded tail reader. Resident
+graph reads charge the requested display window and do not reopen the sidecar
+body. Legacy fallback reserves a fixed 8 MiB working allowance, the requested
+normalized row window, a twelvefold expansion estimate, and 1.5 MiB of output;
+this multiplier is an estimate, not a proof of a universal Python-object
+expansion ratio or a process RSS cap. An output row that cannot fit the window
+returns `413 message_window_too_large`.
 
 Opened file reads enforce the allowance before JSON parsing, and recheck the
 descriptor after reading. DB reads measure BLOB byte lengths plus row overhead
