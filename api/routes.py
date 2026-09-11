@@ -14021,10 +14021,10 @@ def _handle_get_admitted(handler, parsed) -> bool:
                         handler, blob, extra_headers={"X-WebUI-Cache": "hit"}
                     )
 
-                def capture(body, status):
+                def capture(body, status, _resident=resident):
                     if (
                         status == 200
-                        and resident is None
+                        and _resident is None
                         and _resident_session_for_read(sid) is None
                         and path_stamp(session_path) == source
                         and _composer_draft_sidecar_stamp(
