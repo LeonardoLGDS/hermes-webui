@@ -114,6 +114,77 @@ from api.startup import auto_install_agent_deps, fix_credential_permissions
 from api.updates import WEBUI_VERSION
 from api.crash_visibility import install_crash_visibility
 
+# R114: POST paths that begin a new agent turn. While an orderly shutdown is
+# draining in-flight runs, a turn admitted through one of these would be killed
+# at process exit and stamp the user-visible "Response interrupted ... the WebUI
+# process started after this turn began" marker (api/models.py), so the request
+# middleware refuses it here with a retryable 503 instead of accepting work that
+# would be cut.
+_DRAIN_REFUSED_TURN_PATHS = frozenset({
+    "/api/chat/start",
+    "/api/chat",
+    "/api/btw",
+    "/api/background",
+    "/api/session/compression-recovery/start",
+})
+# (begin_shutdown_drain, drain_in_flight_runs, shutdown_drain_requested) from
+# api.streaming, resolved once. The drain helpers themselves live in
+# api/streaming.py because that module owns the STREAMS/ACTIVE_RUNS lifecycle.
+_shutdown_drain_hooks: tuple | None = None
+
+
+def _get_shutdown_drain_hooks() -> tuple:
+    """Return the api.streaming drain hooks, importing them at most once.
+
+    WHY cached: main() pre-warms this before installing the SIGTERM handler so
+    the handler never imports inside a signal context, and the request path
+    never pays a repeated import. A failed import is cached as
+    (None, None, None): shutdown then falls back to today's behaviour (exit)
+    instead of stalling or raising on the stop path.
+    """
+    global _shutdown_drain_hooks
+    if _shutdown_drain_hooks is None:
+        try:
+            from api.streaming import (
+                begin_shutdown_drain,
+                drain_in_flight_runs,
+                shutdown_drain_requested,
+            )
+            _shutdown_drain_hooks = (
+                begin_shutdown_drain,
+                drain_in_flight_runs,
+                shutdown_drain_requested,
+            )
+        except Exception:
+            logger.debug("Shutdown turn-drain hooks unavailable", exc_info=True)
+            _shutdown_drain_hooks = (None, None, None)
+    return _shutdown_drain_hooks
+
+
+def _shutdown_turn_refusal(parsed) -> dict | None:
+    """Retryable 503 payload for a turn start refused during shutdown drain."""
+    if getattr(parsed, "path", None) not in _DRAIN_REFUSED_TURN_PATHS:
+        return None
+    try:
+        requested = _get_shutdown_drain_hooks()[2]
+        if requested is None or not requested():
+            return None
+    except Exception:
+        # WHY fail open: this check runs on every turn start; a broken probe
+        # must not turn a healthy server into one that refuses all turns. The
+        # only cost of a miss is the pre-R114 behaviour (turn cut at exit).
+        logger.debug("Shutdown-drain probe failed; admitting the turn", exc_info=True)
+        return None
+    return {
+        "error": (
+            "WebUI is restarting; this turn was not started. "
+            "Retry in a few seconds."
+        ),
+        "code": "webui_restarting",
+        "type": "webui_restarting",
+        "retryable": True,
+    }
+
 
 class QuietHTTPServer(ThreadingHTTPServer):
     """Custom HTTP server that silently handles common network errors."""
@@ -431,6 +502,9 @@ class Handler(BaseHTTPRequestHandler):
                 parsed.path == "/api/csp-report" and self.command == "POST"
             )
             if not _is_csp_report_post and not check_auth(self, parsed): return
+            refusal = _shutdown_turn_refusal(parsed)
+            if refusal is not None:
+                return j(self, refusal, status=503)
             result = route_func(self, parsed)
             if result is False:
                 return j(self, {'error': 'not found'}, status=404)
@@ -728,10 +802,22 @@ def main() -> None:
     # and guards against double-shutdown (e.g. repeated SIGTERM/SIGINT).
     _shutdown_requested = threading.Event()
 
+    # Pre-warm the drain hooks (see _get_shutdown_drain_hooks) so the signal
+    # handler below never has to import api.streaming from signal context.
+    begin_shutdown_drain, drain_in_flight_runs, _ = _get_shutdown_drain_hooks()
+
     def _request_shutdown(signum, _frame):
         if _shutdown_requested.is_set():
             return
         _shutdown_requested.set()
+        # R114: stop ADMITTING new turns the moment the stop is requested, so a
+        # turn that would be cut at exit is refused with a retryable 503 instead
+        # (see _shutdown_turn_refusal). Must run before serve_forever() returns.
+        if begin_shutdown_drain is not None:
+            try:
+                begin_shutdown_drain()
+            except Exception:
+                logger.debug("Failed to flag the shutdown turn-drain", exc_info=True)
         threading.Thread(
             target=httpd.shutdown,
             name="webui-sigterm-shutdown",
@@ -754,6 +840,14 @@ def main() -> None:
     except (ValueError, OSError):
         # Not on the main thread (e.g. embedded/test harness); skip handler.
         logger.debug("Could not install SIGTERM handler", exc_info=True)
+    # SIGINT is registered too: POST /api/shutdown stops the process with
+    # os.kill(SIGINT), and without a handler that path raised KeyboardInterrupt
+    # mid-serve_forever — skipping both the drain and the refusal flag on exactly
+    # the in-app restart R114 exists for. Ctrl-C now takes the same orderly path.
+    try:
+        signal.signal(signal.SIGINT, _request_shutdown)
+    except (ValueError, OSError):
+        logger.debug("Could not install SIGINT handler", exc_info=True)
 
     # WHY: the promised one-minute sampler stopped twice (09-02/03 evidence).
     # Own its lifecycle here without changing other units or restarting agents.
@@ -794,6 +888,18 @@ def main() -> None:
             memory_thread.join(timeout=2)
         httpd.server_close()
         _log_shutdown_audit()
+        # R114: the HTTP loop has stopped, so WAIT (bounded) for in-flight
+        # agent turns before the interpreter exits and kills their daemon
+        # threads. Runs before the memory-commit drain below so a turn that
+        # finishes here has its teardown commits flushed by that drain too.
+        # Fail-safe: any error falls back to exiting, never to hanging.
+        if drain_in_flight_runs is not None:
+            try:
+                drain_in_flight_runs()
+            except Exception:
+                logger.debug(
+                    "In-flight turn drain failed; exiting without it", exc_info=True
+                )
         try:
             from api.gateway_watcher import stop_watcher
             stop_watcher()

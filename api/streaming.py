@@ -8805,6 +8805,202 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
             rt['is_anthropic_oauth'] = getattr(agent, '_is_anthropic_oauth')
 
 
+# ── R114: bounded drain of in-flight turns during orderly shutdown ──────────
+# WHAT: the WebUI is stopped by SIGTERM (ctl.sh / systemd hermes-webui-home).
+# Turn workers run in DAEMON threads (api/routes.py spawns them with
+# daemon=True), so when the interpreter exits they are torn down mid-provider
+# call while the session still carries active_stream_id / pending_user_message.
+# The next session load then classifies the turn as `process_restart` and
+# stamps the user-visible "Response interrupted ... the WebUI process started
+# after this turn began" marker (api/models.py). WHY this helper exists: the
+# existing shutdown `finally` only drains fire-and-forget MEMORY COMMITS
+# (session_lifecycle.drain_all_on_shutdown), not in-flight turns, so every
+# managed restart that lands during a turn costs that turn. The main thread
+# waits here instead of returning from serve_forever(); daemon workers keep
+# running while the main thread waits, so a normal turn can finish and persist.
+#
+# WHY BOUNDED: systemd's default TimeoutStopSec is 90s and its final action is
+# SIGKILL, which would recreate the very marker this drain prevents. A 45s
+# default covers typical turns with a guaranteed clean-stop margin;
+# HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS overrides it. The override is clamped to
+# _SHUTDOWN_DRAIN_MAX_SECONDS so no setting can push the stop past the stop
+# budget (the remaining explicit drains still get room) and manufacture a
+# SIGKILL. A non-positive/invalid value disables the wait → today's behaviour.
+_SHUTDOWN_DRAIN_DEFAULT_SECONDS = 45.0
+# 90s systemd budget − 30s memory-commit drain (drain_all_on_shutdown) − 5s
+# teardown margin.
+_SHUTDOWN_DRAIN_MAX_SECONDS = 55.0
+# Poll while runs are live; settle-recheck once after the registry empties.
+# The settle covers the route→worker window: a route registers its STREAMS
+# entry before it spawns the worker (api/routes.py), so "empty" could be a
+# turn admitted just before SIGTERM that has not registered ACTIVE_RUNS yet.
+_SHUTDOWN_DRAIN_POLL_SECONDS = 0.2
+_SHUTDOWN_DRAIN_SETTLE_SECONDS = 0.25
+_SHUTDOWN_DRAIN_REQUESTED = threading.Event()
+
+
+def _log_shutdown_drain(message: str, *args) -> None:
+    """Emit one shutdown-drain line to both the logger and stdout.
+
+    WHY stdout as well: server.py configures no logging handler, so the stdlib
+    root logger stays at WARNING and a logger.info line never reaches the
+    operator's journal — which would make "why did this stop take 8s"
+    unanswerable. ctl.sh/systemd capture this process's stdout, and the rest of
+    the startup/shutdown chatter is printed the same way.
+    """
+    try:
+        logger.info(message, *args)
+    except Exception:
+        pass
+    try:
+        print(message % args if args else message, flush=True)
+    except Exception:
+        pass
+
+
+def begin_shutdown_drain() -> None:
+    """Flag an orderly shutdown so new turns are refused, not accepted+cut."""
+    _SHUTDOWN_DRAIN_REQUESTED.set()
+
+
+def shutdown_drain_requested() -> bool:
+    """True from the moment an orderly shutdown was requested."""
+    return _SHUTDOWN_DRAIN_REQUESTED.is_set()
+
+
+def shutdown_drain_seconds() -> float:
+    """Resolve the bounded drain window, clamped inside the systemd budget."""
+    raw = os.environ.get("HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS", "")
+    try:
+        seconds = float(raw) if str(raw).strip() else _SHUTDOWN_DRAIN_DEFAULT_SECONDS
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS=%r; using %.0fs",
+            raw, _SHUTDOWN_DRAIN_DEFAULT_SECONDS,
+        )
+        seconds = _SHUTDOWN_DRAIN_DEFAULT_SECONDS
+    if not math.isfinite(seconds) or seconds <= 0:
+        return 0.0
+    if seconds > _SHUTDOWN_DRAIN_MAX_SECONDS:
+        logger.warning(
+            "Clamping HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS=%.1fs to %.1fs so the "
+            "stop stays inside the systemd TimeoutStopSec budget",
+            seconds, _SHUTDOWN_DRAIN_MAX_SECONDS,
+        )
+        return _SHUTDOWN_DRAIN_MAX_SECONDS
+    return seconds
+
+
+def _in_flight_run_snapshot() -> dict:
+    """Return {stream_id: run metadata} for every run still executing.
+
+    ACTIVE_RUNS is the authoritative worker-liveness registry (a cancelled or
+    reconnected stream can drop STREAMS while its worker is still unwinding),
+    but STREAMS is read too: routes register the stream channel BEFORE they
+    spawn the worker thread, so without the STREAMS half a turn admitted a
+    moment before the signal would be invisible here and killed at exit.
+
+    Rows in phase="cancelling" are excluded by active_run_is_attachable: that
+    turn is already terminal from the client's perspective, so waiting on it
+    would only delay the restart.
+    """
+    from api import config as _drain_cfg
+
+    snapshot: dict = {}
+    try:
+        with _drain_cfg.ACTIVE_RUNS_LOCK:
+            for stream_id, entry in (_drain_cfg.ACTIVE_RUNS or {}).items():
+                if _drain_cfg.active_run_is_attachable(entry):
+                    snapshot[str(stream_id)] = dict(entry) if isinstance(entry, dict) else {}
+    except Exception:
+        logger.debug("Failed to snapshot ACTIVE_RUNS for the shutdown drain", exc_info=True)
+        return snapshot
+    try:
+        with STREAMS_LOCK:
+            for stream_id in list((STREAMS or {}).keys()):
+                snapshot.setdefault(str(stream_id), {})
+    except Exception:
+        logger.debug("Failed to snapshot STREAMS for the shutdown drain", exc_info=True)
+    return snapshot
+
+
+def drain_in_flight_runs(
+    deadline_seconds: float | None = None,
+    *,
+    poll_seconds: float | None = None,
+    settle_seconds: float | None = None,
+) -> dict:
+    """Wait (bounded) for in-flight agent runs before the process exits.
+
+    Called from server.py's `finally` around `serve_forever()` after the HTTP
+    server has been asked to stop. Logs one line per waited run plus one
+    outcome line ("finished" when the registry drained, "bound_hit" when the
+    deadline expired first). NEVER raises and never waits past the deadline:
+    the caller sits on systemd's stop path, so any failure here must fall back
+    to today's behaviour (exit immediately) rather than wedge the unit in
+    "stopping" until SIGKILL.
+    """
+    try:
+        if deadline_seconds is None:
+            deadline_seconds = shutdown_drain_seconds()
+        deadline_seconds = float(deadline_seconds)
+        if not math.isfinite(deadline_seconds) or deadline_seconds <= 0:
+            _log_shutdown_drain(
+                "[shutdown-drain] outcome=disabled waited=0 disabled_by=env_or_zero_bound"
+            )
+            return {"outcome": "disabled", "elapsed": 0.0, "waited": []}
+    except Exception:
+        logger.debug("Shutdown drain could not resolve its deadline; exiting", exc_info=True)
+        return {"outcome": "error", "elapsed": 0.0, "waited": []}
+    try:
+        poll = float(poll_seconds) if poll_seconds is not None else _SHUTDOWN_DRAIN_POLL_SECONDS
+        settle = float(settle_seconds) if settle_seconds is not None else _SHUTDOWN_DRAIN_SETTLE_SECONDS
+    except (TypeError, ValueError):
+        poll, settle = _SHUTDOWN_DRAIN_POLL_SECONDS, _SHUTDOWN_DRAIN_SETTLE_SECONDS
+    poll = max(0.01, poll)
+    settle = max(0.0, settle)
+
+    started = time.monotonic()
+    waited: dict = {}
+    settle_checked = False
+    outcome = "finished"
+    try:
+        while True:
+            pending = _in_flight_run_snapshot()
+            if pending:
+                settle_checked = False
+                for stream_id, entry in pending.items():
+                    if stream_id in waited:
+                        continue
+                    waited[stream_id] = True
+                    _log_shutdown_drain(
+                        "[shutdown-drain] waiting for run stream=%s session=%s phase=%s",
+                        stream_id,
+                        (entry.get("session_id") if entry else None) or "unknown",
+                        (entry.get("phase") if entry else None) or "unknown",
+                    )
+                remaining = deadline_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    outcome = "bound_hit"
+                    break
+                time.sleep(min(poll, remaining))
+                continue
+            remaining = deadline_seconds - (time.monotonic() - started)
+            if settle_checked or remaining <= 0:
+                break
+            settle_checked = True
+            time.sleep(min(settle, remaining))
+    except Exception:
+        outcome = "error"
+        logger.debug("Shutdown drain failed; exiting without waiting further", exc_info=True)
+    elapsed = time.monotonic() - started
+    _log_shutdown_drain(
+        "[shutdown-drain] outcome=%s waited=%d elapsed=%.2fs bound=%.1fs",
+        outcome, len(waited), elapsed, deadline_seconds,
+    )
+    return {"outcome": outcome, "elapsed": elapsed, "waited": sorted(waited)}
+
+
 def _run_agent_streaming(
     session_id,
     msg_text,
