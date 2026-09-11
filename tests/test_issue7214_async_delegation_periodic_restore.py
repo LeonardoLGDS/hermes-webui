@@ -37,10 +37,12 @@ def _reset_retry_state():
     peu._reset_legacy_async_delivery_dedupe_for_tests()
 
 
-def _install_fake_restore(monkeypatch, restore):
+def _install_fake_restore(monkeypatch, restore, durable=None):
     tools = types.ModuleType("tools")
     async_delegation = types.ModuleType("tools.async_delegation")
     async_delegation.restore_undelivered_completions = restore
+    if durable is not None:
+        async_delegation.get_durable_delegation = durable
     tools.async_delegation = async_delegation
     monkeypatch.setitem(sys.modules, "tools", tools)
     monkeypatch.setitem(sys.modules, "tools.async_delegation", async_delegation)
@@ -56,6 +58,42 @@ def _capture_timers(monkeypatch):
 
     monkeypatch.setattr(peu.threading, "Timer", build_timer)
     return timers
+
+
+def test_public_retry_scheduler_keeps_idle_pending_backlog_alive(monkeypatch):
+    """The existing event-facing scheduler must enter the periodic retry chain."""
+    restored_counts = iter([1, 0])
+    restore_calls = []
+    durable_reads = []
+
+    def restore(queue):
+        restore_calls.append(queue)
+        return next(restored_counts)
+
+    def get_durable(delegation_id):
+        durable_reads.append(delegation_id)
+        return {"delivery_state": "pending"}
+
+    _install_fake_restore(monkeypatch, restore, get_durable)
+    timers = _capture_timers(monkeypatch)
+    completion_queue = object()
+    evt = {"type": "async_delegation", "delegation_id": "deleg_public"}
+
+    assert peu.schedule_async_delegation_claim_retry(evt, completion_queue, delay=0.0)
+    assert durable_reads == ["deleg_public"]
+    assert len(timers) == 1
+
+    timers[0].fire()
+
+    assert restore_calls == [completion_queue]
+    assert len(timers) == 2, "restored durable work must retry without another turn"
+    assert timers[1].interval == peu.ASYNC_DELIVERY_CLAIM_RETRY_SECONDS
+
+    timers[1].fire()
+
+    assert restore_calls == [completion_queue, completion_queue]
+    assert len(timers) == 2
+    assert peu.async_delivery_retry_timer_count() == 0
 
 
 def test_successful_restore_rearms_until_durable_backlog_clears(monkeypatch):
