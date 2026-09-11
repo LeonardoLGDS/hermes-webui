@@ -6,6 +6,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from api import rollback
 import api.workspace as workspace_mod
 
@@ -133,6 +135,9 @@ def test_checkpoint_diff_skips_workspace_fifo_without_hanging(tmp_path, monkeypa
     blocking O_RDONLY, which blocks forever on a FIFO with no writer) and must
     not leak an fd — the leaf type is pre-checked via lstat before any open.
     """
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable on this platform")
+
     import threading
 
     workspace, ckpt_dir, checkpoint = _init_checkpoint(tmp_path, monkeypatch)
