@@ -319,6 +319,9 @@ def test_read_live_agent_update_rejects_fifo_marker_without_hanging(tmp_path: Pa
     request path. The hardened read opens O_NONBLOCK|O_NOFOLLOW and fstat-checks
     for a small regular file, so a FIFO is rejected immediately.
     """
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("FIFO creation is unavailable on this platform")
+
     from api import agent_runtime
 
     fifo = tmp_path / "fifo-marker"
