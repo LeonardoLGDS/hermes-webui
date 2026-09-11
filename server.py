@@ -127,9 +127,12 @@ _DRAIN_REFUSED_TURN_PATHS = frozenset({
     "/api/background",
     "/api/session/compression-recovery/start",
 })
-# (begin_shutdown_drain, drain_in_flight_runs, shutdown_drain_requested) from
-# api.streaming, resolved once. The drain helpers themselves live in
-# api/streaming.py because that module owns the STREAMS/ACTIVE_RUNS lifecycle.
+# (begin_shutdown_drain, drain_in_flight_runs, shutdown_drain_requested,
+# log_shutdown_drain) from api.streaming, resolved once. The drain helpers
+# themselves live in api/streaming.py because that module owns the
+# STREAMS/ACTIVE_RUNS/SESSION_WRITEBACK_OWNERS lifecycle; log_shutdown_drain is
+# the durable audit sink so a drain that raises before writing its own outcome
+# line still leaves evidence in the journal (R115, session dbc734a8c477).
 _shutdown_drain_hooks: tuple | None = None
 
 
@@ -139,8 +142,8 @@ def _get_shutdown_drain_hooks() -> tuple:
     WHY cached: main() pre-warms this before installing the SIGTERM handler so
     the handler never imports inside a signal context, and the request path
     never pays a repeated import. A failed import is cached as
-    (None, None, None): shutdown then falls back to today's behaviour (exit)
-    instead of stalling or raising on the stop path.
+    (None, None, None, None): shutdown then falls back to today's behaviour
+    (exit) instead of stalling or raising on the stop path.
     """
     global _shutdown_drain_hooks
     if _shutdown_drain_hooks is None:
@@ -148,16 +151,18 @@ def _get_shutdown_drain_hooks() -> tuple:
             from api.streaming import (
                 begin_shutdown_drain,
                 drain_in_flight_runs,
+                log_shutdown_drain,
                 shutdown_drain_requested,
             )
             _shutdown_drain_hooks = (
                 begin_shutdown_drain,
                 drain_in_flight_runs,
                 shutdown_drain_requested,
+                log_shutdown_drain,
             )
         except Exception:
             logger.debug("Shutdown turn-drain hooks unavailable", exc_info=True)
-            _shutdown_drain_hooks = (None, None, None)
+            _shutdown_drain_hooks = (None, None, None, None)
     return _shutdown_drain_hooks
 
 
@@ -804,7 +809,12 @@ def main() -> None:
 
     # Pre-warm the drain hooks (see _get_shutdown_drain_hooks) so the signal
     # handler below never has to import api.streaming from signal context.
-    begin_shutdown_drain, drain_in_flight_runs, _ = _get_shutdown_drain_hooks()
+    (
+        begin_shutdown_drain,
+        drain_in_flight_runs,
+        _,
+        log_shutdown_drain,
+    ) = _get_shutdown_drain_hooks()
 
     def _request_shutdown(signum, _frame):
         if _shutdown_requested.is_set():
@@ -896,10 +906,24 @@ def main() -> None:
         if drain_in_flight_runs is not None:
             try:
                 drain_in_flight_runs()
-            except Exception:
+            except BaseException:
+                # BaseException, not Exception: tonight (2026-09-11) the
+                # outcome line was missing and the failure unattributable, so
+                # an interrupted drain must still leave a durable audit line.
+                # Swallow it and continue the normal stop path (never hang).
                 logger.debug(
                     "In-flight turn drain failed; exiting without it", exc_info=True
                 )
+                if log_shutdown_drain is not None:
+                    try:
+                        log_shutdown_drain(
+                            "[shutdown-drain] outcome=error waited=0 "
+                            "elapsed=0.00s bound=0.0s persist=0 raised=1"
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Failed to log the raised drain outcome", exc_info=True
+                        )
         try:
             from api.gateway_watcher import stop_watcher
             stop_watcher()

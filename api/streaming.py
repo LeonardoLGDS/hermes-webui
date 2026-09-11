@@ -8839,23 +8839,66 @@ _SHUTDOWN_DRAIN_SETTLE_SECONDS = 0.25
 _SHUTDOWN_DRAIN_REQUESTED = threading.Event()
 
 
+def _write_shutdown_drain_line(line: str) -> bool:
+    """Write one drain line to the process's durable stdout sink.
+
+    WHY a raw fd write instead of ``print``: tonight's live acceptance
+    (2026-09-11, session dbc734a8c477) lost the drain's FINAL outcome line
+    while the earlier "waiting for run" lines reached the journal — the
+    outcome line is the last write of the stop path and lands while the
+    interpreter is finalizing, where ``sys.stdout`` may already be detached
+    or closed and ``print``'s failure is swallowed. fd 1 is the same durable
+    sink ctl.sh/systemd capture for the waiting lines; ``os.write`` is
+    unbuffered and survives teardown of the stdio wrapper. The stdio fallbacks
+    keep embedded/test harnesses (redirected ``sys.stdout``) working.
+    """
+    try:
+        os.write(1, (line + "\n").encode("utf-8", "replace"))
+        return True
+    except Exception:
+        pass
+    for stream in (sys.stdout, getattr(sys, "__stdout__", None)):
+        try:
+            if stream is None:
+                continue
+            stream.write(line + "\n")
+            stream.flush()
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _log_shutdown_drain(message: str, *args) -> None:
-    """Emit one shutdown-drain line to both the logger and stdout.
+    """Emit one shutdown-drain line to both the logger and the durable stdout sink.
 
     WHY stdout as well: server.py configures no logging handler, so the stdlib
     root logger stays at WARNING and a logger.info line never reaches the
     operator's journal — which would make "why did this stop take 8s"
     unanswerable. ctl.sh/systemd capture this process's stdout, and the rest of
-    the startup/shutdown chatter is printed the same way.
+    the startup/shutdown chatter is printed the same way. Both sinks are
+    attempted on EVERY call, including the final outcome line, so an
+    unauditable drain (tonight's defect) cannot recur.
     """
     try:
         logger.info(message, *args)
     except Exception:
         pass
     try:
-        print(message % args if args else message, flush=True)
+        line = message % args if args else message
     except Exception:
-        pass
+        line = str(message)
+    _write_shutdown_drain_line(line)
+
+
+def log_shutdown_drain(message: str, *args) -> None:
+    """Public durable-sink entry point for shutdown-drain audit lines.
+
+    server.py imports this (via ``_get_shutdown_drain_hooks``) so the stop path
+    can record a drain that raised before it could log its own outcome through
+    the same sink the drain's own lines use (R115 auditability requirement).
+    """
+    _log_shutdown_drain(message, *args)
 
 
 def begin_shutdown_drain() -> None:
@@ -8924,21 +8967,58 @@ def _in_flight_run_snapshot() -> dict:
     return snapshot
 
 
+def _session_writeback_snapshot() -> dict:
+    """Return {session_id: owner_stream_id} for sessions still owning a writeback.
+
+    WHY this is the durable-outcome signal (R115): ``ACTIVE_RUNS``/``STREAMS``
+    answer "is a worker alive"; ``SESSION_WRITEBACK_OWNERS`` (api/config.py:9251)
+    answers "does a turn still own this session's transcript writeback". Tonight
+    (2026-09-11, session dbc734a8c477) the drain exited when the RUN registry
+    emptied while the completed turn's deferred final persist was still in
+    flight, so the persist was lost, ``active_stream_id`` stayed set on disk and
+    the next load stamped "Response started after this turn began". The worker
+    releases this record only in its teardown (api/streaming.py
+    ``clear_session_writeback_owner_if_owned``), i.e. after the persist it
+    owns, so waiting on it closes the registry-vs-outcome gap.
+    """
+    from api import config as _drain_cfg
+
+    snapshot: dict = {}
+    try:
+        with _drain_cfg.SESSION_WRITEBACK_OWNERS_LOCK:
+            for session_id, owner in (_drain_cfg.SESSION_WRITEBACK_OWNERS or {}).items():
+                sid = str(session_id or "").strip()
+                owner_id = str(owner or "").strip()
+                if sid and owner_id:
+                    snapshot[sid] = owner_id
+    except Exception:
+        logger.debug(
+            "Failed to snapshot session writebacks for the shutdown drain",
+            exc_info=True,
+        )
+    return snapshot
+
+
 def drain_in_flight_runs(
     deadline_seconds: float | None = None,
     *,
     poll_seconds: float | None = None,
     settle_seconds: float | None = None,
 ) -> dict:
-    """Wait (bounded) for in-flight agent runs before the process exits.
+    """Wait (bounded) for in-flight runs AND their result persistence to land.
 
     Called from server.py's `finally` around `serve_forever()` after the HTTP
     server has been asked to stop. Logs one line per waited run plus one
-    outcome line ("finished" when the registry drained, "bound_hit" when the
+    outcome line ("finished" when the registries drained, "bound_hit" when the
     deadline expired first). NEVER raises and never waits past the deadline:
     the caller sits on systemd's stop path, so any failure here must fall back
     to today's behaviour (exit immediately) rather than wedge the unit in
     "stopping" until SIGKILL.
+
+    R115: after the RUN registry empties the drain ALSO waits, within the same
+    deadline, for the drained sessions' writeback-ownership records to clear —
+    the durable outcome can still be in flight when the worker row is gone
+    (tonight's lost persist, session dbc734a8c477).
     """
     try:
         if deadline_seconds is None:
@@ -8949,7 +9029,12 @@ def drain_in_flight_runs(
                 "[shutdown-drain] outcome=disabled waited=0 disabled_by=env_or_zero_bound"
             )
             return {"outcome": "disabled", "elapsed": 0.0, "waited": []}
-    except Exception:
+    except BaseException:
+        # BaseException, not Exception: the audit line must survive even an
+        # interrupt/system-exit during resolution, or the stop is unreadable.
+        _log_shutdown_drain(
+            "[shutdown-drain] outcome=error waited=0 elapsed=0.00s bound=0.0s persist=0"
+        )
         logger.debug("Shutdown drain could not resolve its deadline; exiting", exc_info=True)
         return {"outcome": "error", "elapsed": 0.0, "waited": []}
     try:
@@ -8962,6 +9047,7 @@ def drain_in_flight_runs(
 
     started = time.monotonic()
     waited: dict = {}
+    waited_persist: dict = {}
     settle_checked = False
     outcome = "finished"
     try:
@@ -8985,20 +9071,52 @@ def drain_in_flight_runs(
                     break
                 time.sleep(min(poll, remaining))
                 continue
+            # R115: the RUN registry emptying is worker liveness, not proof the
+            # turn's outcome is durable. A deferred-save completing turn owns
+            # its session's writeback until its final transcript persist lands,
+            # and that record can outlive the run row (tonight it did: the
+            # drain exited, the persist was lost, the next load stamped the
+            # dbc734a8c477 marker). Wait for it inside the SAME deadline.
+            pending_persist = _session_writeback_snapshot()
+            if pending_persist:
+                settle_checked = False
+                for session_id, owner in pending_persist.items():
+                    if session_id in waited_persist:
+                        continue
+                    waited_persist[session_id] = owner
+                    _log_shutdown_drain(
+                        "[shutdown-drain] waiting for result persistence session=%s stream=%s",
+                        session_id,
+                        owner,
+                    )
+                remaining = deadline_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    outcome = "bound_hit"
+                    break
+                time.sleep(min(poll, remaining))
+                continue
             remaining = deadline_seconds - (time.monotonic() - started)
             if settle_checked or remaining <= 0:
                 break
             settle_checked = True
             time.sleep(min(settle, remaining))
-    except Exception:
+    except BaseException:
+        # Swallow (including KeyboardInterrupt/SystemExit) so the outcome line
+        # below always reaches the journal and the unit still exits as pre-R114
+        # did; the caller sits on systemd's stop path and must never hang.
         outcome = "error"
         logger.debug("Shutdown drain failed; exiting without waiting further", exc_info=True)
     elapsed = time.monotonic() - started
     _log_shutdown_drain(
-        "[shutdown-drain] outcome=%s waited=%d elapsed=%.2fs bound=%.1fs",
-        outcome, len(waited), elapsed, deadline_seconds,
+        "[shutdown-drain] outcome=%s waited=%d elapsed=%.2fs bound=%.1fs persist=%d",
+        outcome, len(waited), elapsed, deadline_seconds, len(waited_persist),
     )
-    return {"outcome": outcome, "elapsed": elapsed, "waited": sorted(waited)}
+    return {
+        "outcome": outcome,
+        "elapsed": elapsed,
+        "waited": sorted(waited),
+        "persist_waited": sorted(waited_persist),
+    }
 
 
 def _run_agent_streaming(
