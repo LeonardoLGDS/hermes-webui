@@ -195,7 +195,10 @@ def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> 
     The durable database is the backlog. Keeping one shared timer avoids both
     one-thread-per-event growth and lossy eviction of individual retry entries.
     The sweep restores every still-pending record; atomic claims suppress races
-    and delivered rows are excluded by the core query.
+    and delivered rows are excluded by the core query. A successful sweep that
+    restores pending rows re-arms itself at the normal claim horizon until the
+    durable backlog clears, so idle origin sessions do not depend on unrelated
+    turn activity to trigger the next recovery pass.
     """
     global _ASYNC_DELIVERY_RETRY_TIMER
     global _ASYNC_DELIVERY_RETRY_DEADLINE
@@ -236,7 +239,12 @@ def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> 
             try:
                 from tools.async_delegation import restore_undelivered_completions
 
-                restore_undelivered_completions(target_queue)
+                restored = restore_undelivered_completions(target_queue)
+                if restored:
+                    _arm_async_delegation_restore_sweep(
+                        target_queue,
+                        ASYNC_DELIVERY_CLAIM_RETRY_SECONDS,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to restore pending async delegations; retrying sweep",
