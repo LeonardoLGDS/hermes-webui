@@ -38,7 +38,6 @@ class AsyncDelegationDeliveryClaim:
 
 def completion_delivery_id(evt: Any) -> str:
     """Return the stable WebUI delivery/dedupe id for a completion event.
-
     Terminal background-process events use ``session_id`` for the process id.
     Async ``delegate_task`` completions carry ``delegation_id`` instead, so both
     WebUI delivery paths must key those events by ``delegation_id``.
@@ -83,7 +82,6 @@ def wakeup_display_meta(text: Any) -> dict | None:
     text is not one of those pinned shapes. Header fields only — the output
     section stays in the message body (the UI extracts it there), so the
     metadata never duplicates multi-KB process output in the store.
-
     Header fields are anchored to the pinned single-line grammar (``sid``,
     ``exit_code``, ``command``, ``pattern`` never contain newlines). The
     optional watch suppression note is deliberately NOT parsed out: it lives in
@@ -119,7 +117,6 @@ def wakeup_display_meta(text: Any) -> dict | None:
 
 def attach_wakeup_display_meta(msg: Any, source: Any) -> None:
     """Stamp ``_wakeup_meta`` on a process-wakeup user message, best-effort.
-
     Companion to the ``_source`` stamp: display-only (``_wakeup_meta`` is not
     in ``_API_SAFE_MSG_KEYS``, so it never reaches a provider) and never
     raises — an unparseable body simply leaves the message unstamped and the
@@ -158,7 +155,6 @@ def stamp_message_source(
     active_turn_token: Any = None,
 ) -> None:
     """Stamp ``_source`` and any display metadata on a materialized user turn.
-
     Single choke point for every path that persists a non-``webui`` user turn
     (result merges, eager checkpoint, and the pending-turn recovery paths) so a
     future source-bearing recovery site cannot silently skip the ``_wakeup_meta``
@@ -191,22 +187,22 @@ def _release_bounded_local(delegation_id: str) -> None:
 
 def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> bool:
     """Arm one process-wide durable restore sweep at the earliest deadline.
-
     The durable database is the backlog. Keeping one shared timer avoids both
     one-thread-per-event growth and lossy eviction of individual retry entries.
     The sweep restores every still-pending record; atomic claims suppress races
-    and delivered rows are excluded by the core query.
+    and delivered rows are excluded by the core query. A successful sweep that
+    restores pending rows re-arms itself at the normal claim horizon until the
+    durable backlog clears, so idle origin sessions do not depend on unrelated
+    turn activity to trigger the next recovery pass.
     """
     global _ASYNC_DELIVERY_RETRY_TIMER
     global _ASYNC_DELIVERY_RETRY_DEADLINE
     global _ASYNC_DELIVERY_RETRY_QUEUE
     global _ASYNC_DELIVERY_RETRY_GENERATION
-
     if completion_queue is None:
         return False
     retry_delay = max(0.0, float(delay))
     deadline = time.monotonic() + retry_delay
-
     with _ASYNC_DELIVERY_RETRY_LOCK:
         if (
             _ASYNC_DELIVERY_RETRY_TIMER is not None
@@ -220,12 +216,10 @@ def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> 
         generation = _ASYNC_DELIVERY_RETRY_GENERATION
         _ASYNC_DELIVERY_RETRY_DEADLINE = deadline
         _ASYNC_DELIVERY_RETRY_QUEUE = completion_queue
-
         def _restore() -> None:
             global _ASYNC_DELIVERY_RETRY_TIMER
             global _ASYNC_DELIVERY_RETRY_DEADLINE
             global _ASYNC_DELIVERY_RETRY_QUEUE
-
             with _ASYNC_DELIVERY_RETRY_LOCK:
                 if generation != _ASYNC_DELIVERY_RETRY_GENERATION:
                     return
@@ -235,8 +229,12 @@ def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> 
                 _ASYNC_DELIVERY_RETRY_QUEUE = None
             try:
                 from tools.async_delegation import restore_undelivered_completions
-
-                restore_undelivered_completions(target_queue)
+                restored = restore_undelivered_completions(target_queue)
+                if restored:
+                    _arm_async_delegation_restore_sweep(
+                        target_queue,
+                        ASYNC_DELIVERY_CLAIM_RETRY_SECONDS,
+                    )
             except Exception:
                 logger.warning(
                     "Failed to restore pending async delegations; retrying sweep",
@@ -246,7 +244,6 @@ def _arm_async_delegation_restore_sweep(completion_queue: Any, delay: float) -> 
                     target_queue,
                     ASYNC_DELIVERY_ROUTING_RETRY_SECONDS,
                 )
-
         timer = threading.Timer(retry_delay, _restore)
         timer.daemon = True
         _ASYNC_DELIVERY_RETRY_TIMER = timer
@@ -268,7 +265,6 @@ def schedule_async_delegation_claim_retry(
         return False
     try:
         from tools.async_delegation import get_durable_delegation
-
         durable = get_durable_delegation(delegation_id)
     except (ImportError, AttributeError):
         return False
@@ -281,7 +277,6 @@ def schedule_async_delegation_claim_retry(
         return False
     if not isinstance(durable, dict) or durable.get("delivery_state") != "pending":
         return False
-
     retry_delay = (
         ASYNC_DELIVERY_CLAIM_RETRY_SECONDS if delay is None else max(0.0, float(delay))
     )
@@ -297,7 +292,6 @@ def requeue_async_delegation_event(
     durable: bool | None = None,
 ) -> bool:
     """Requeue an async event, falling back to the durable restore sweep.
-
     Callers pass the queue reference they already resolved so an import failure
     cannot strand a released durable claim. Legacy events without a durable row
     still get one best-effort direct requeue; durable events additionally arm a
@@ -347,7 +341,6 @@ def claim_async_delegation_delivery(
     consumer: str,
 ) -> AsyncDelegationDeliveryClaim | None:
     """Atomically claim an async completion for one WebUI delivery path.
-
     Current Hermes Agent builds provide a durable SQLite-backed claim contract.
     Older builds fall back to the bounded process-local claim above. The local
     claim also serializes duplicate legacy events on current cores where no
@@ -358,7 +351,6 @@ def claim_async_delegation_delivery(
     delegation_id = completion_delivery_id(evt)
     if not delegation_id or not _claim_bounded_local(delegation_id):
         return None
-
     try:
         from tools.async_delegation import (
             claim_event_delivery,
@@ -371,7 +363,6 @@ def claim_async_delegation_delivery(
             claim_id="",
             durable=False,
         )
-
     try:
         claim_id = claim_event_delivery(evt, str(consumer or "webui"))
     except Exception:
@@ -398,7 +389,6 @@ def _mark_legacy_async_delivery_complete(delegation_id: str) -> bool:
         from tools import async_delegation as async_delivery
     except Exception:
         return False
-
     marker = getattr(async_delivery, "mark_completion_delivered", None)
     if callable(marker):
         try:
@@ -410,7 +400,6 @@ def _mark_legacy_async_delivery_complete(delegation_id: str) -> bool:
                 delegation_id,
                 exc_info=True,
             )
-
     legacy_marker = getattr(async_delivery, "mark_async_delegation_consumed", None)
     if callable(legacy_marker):
         try:
@@ -432,7 +421,6 @@ def complete_async_delegation_delivery(
     """Complete a claim after WebUI has accepted the event for delivery."""
     if claim.durable:
         from tools.async_delegation import complete_event_delivery
-
         try:
             complete_event_delivery(evt, claim.claim_id)
             _cancel_async_delegation_claim_retry(claim.delegation_id)
@@ -459,7 +447,6 @@ def release_async_delegation_delivery(
     try:
         if claim.durable:
             from tools.async_delegation import release_event_delivery
-
             release_event_delivery(evt, claim.claim_id)
     except Exception:
         logger.warning(
@@ -482,7 +469,6 @@ def _reset_legacy_async_delivery_dedupe_for_tests() -> None:
     global _ASYNC_DELIVERY_RETRY_DEADLINE
     global _ASYNC_DELIVERY_RETRY_QUEUE
     global _ASYNC_DELIVERY_RETRY_GENERATION
-
     with _LEGACY_ASYNC_DELIVERY_LOCK:
         _LEGACY_ASYNC_DELIVERY_IDS.clear()
     with _ASYNC_DELIVERY_RETRY_LOCK:
