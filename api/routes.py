@@ -9879,6 +9879,154 @@ def _load_state_db_messages_with_stable_signature(session_id, profile, reader_kw
     return rows, stable
 
 
+# perf(R112): GET /api/session recomputed the regeneration authority verdict on
+# every load. That verdict is a pure function of the state.db-reconciled
+# transcript plus a few persisted session flags, so recomputing it costs a FULL
+# state.db reconcile + append-only merge plus two whole-transcript SHA-256
+# passes (~65ms on a 21 MB cold sidecar; the dominant work in the t4 stage
+# under I/O pressure, and it ran even for metadata-only opens). Memoize the
+# verdict per session while every input is provably unchanged, INCLUDING the
+# common "declined" (None) verdict that long/imported transcripts produce.
+#
+# Watermark (cache key) = sidecar stat signature (path, mtime_ns, size,
+# ctime_ns) + the per-target-session state.db revision (its high-water mark,
+# the same sanctioned writer contract the display-merge cache keys on) + an
+# in-memory transcript identity + the truncation watermark/boundary + the
+# session flags regeneration_authority() reads. A write to either store moves
+# at least one component, so a stale entry is never served. Mechanism is
+# in-process (mirrors _display_merge_cache): the first load in a fresh process
+# recomputes; every later unchanged load is skippable. A persisted watermark
+# was considered and rejected -- it would need its own cross-process writer
+# contract for no additional coverage, since the display-merge cache already
+# proves the in-process contract holds on this exact path.
+#
+# Fail OPEN: when any component cannot be resolved (missing sidecar stat,
+# unavailable state.db revision, active stream/pending message, invalid id),
+# the caller recomputes rather than guessing. A wrong skip would surface a
+# stale regeneration verdict; an unnecessary merge is only slower.
+_REGENERATION_REVISION_CACHE_MAX = 8
+_REGENERATION_REVISION_CACHE_MISS = object()
+_regeneration_revision_cache: "OrderedDict[str, dict]" = OrderedDict()
+_regeneration_revision_cache_lock = threading.Lock()
+
+
+def _regeneration_transcript_identity(messages) -> tuple:
+    """Cheap identity of an in-memory transcript that guards unsaved appends.
+
+    Mirrors the display-merge cache's (row count, last timestamp) guard: it can
+    only force an extra recompute, never a missed change.
+    """
+    if not isinstance(messages, (list, tuple)):
+        return (-1, None)
+    last_ts = None
+    if messages:
+        last = messages[-1]
+        if isinstance(last, dict):
+            last_ts = last.get("timestamp")
+    return (len(messages), last_ts)
+
+
+def _regeneration_authority_session_identity(session) -> tuple:
+    """Session flags regeneration_authority() reads beyond the transcript.
+
+    These are all sidecar-persisted flags, so the sidecar stat signature
+    already moves when they change; repeating them here makes the cache key
+    self-contained instead of relying on that coupling.
+    """
+    return (
+        bool(getattr(session, "read_only", False)),
+        bool(getattr(session, "is_cli_session", False)),
+        getattr(session, "session_source", None),
+        getattr(session, "raw_source", None),
+        getattr(session, "source_tag", None),
+        getattr(session, "parent_session_id", None),
+    )
+
+
+def _regeneration_revision_cache_key(session):
+    """Return a fail-closed watermark for the load-path regeneration revision.
+
+    None means "do not reuse": any component that cannot be resolved exactly
+    disables the shortcut for this request rather than risking a stale value.
+    """
+    from api.models import _sidecar_stat_signature
+
+    sid = str(getattr(session, "session_id", "") or "")
+    if not sid or not is_safe_session_id(sid):
+        return None
+    if _display_merge_session_is_active(session):
+        return None
+    self_sig = _sidecar_stat_signature(SESSION_DIR / f"{sid}.json")
+    if self_sig is None:
+        return None
+    state_sig = _state_db_session_signature(sid, getattr(session, "profile", None))
+    if state_sig is None:
+        return None
+    # reconciliation reads context_messages only when prefer_context is set and
+    # the list is non-empty; otherwise it reads messages. Key on whichever the
+    # merge would actually consume.
+    context_messages = getattr(session, "context_messages", None)
+    if not isinstance(context_messages, list) or not context_messages:
+        context_messages = getattr(session, "messages", None)
+    return (
+        sid,
+        self_sig,
+        state_sig,
+        _regeneration_transcript_identity(getattr(session, "messages", None)),
+        _regeneration_transcript_identity(context_messages),
+        getattr(session, "truncation_watermark", None),
+        getattr(session, "truncation_boundary", None),
+        # regeneration_authority()'s writability verdict also reads these
+        # persisted session flags; including them keeps a cached "not
+        # regenerable" outcome honest if ownership changes without the
+        # transcript moving.
+        _regeneration_authority_session_identity(session),
+    )
+
+
+def _regeneration_revision_cache_lookup(session):
+    """Return ``(cache_key, revision_or_MISS)`` for the load-path revision.
+
+    The key is resolved BEFORE the revision is computed and is handed back so
+    the caller can store the result under the same watermark it probed with.
+    Fail open: any component that cannot be resolved exactly reports a miss, so
+    the caller recomputes instead of risking a stale revision.
+
+    A cached ``None`` is a real hit: regeneration_authority() legitimately
+    declines most imported/long transcripts, and that verdict is exactly what
+    this gate must not re-derive on every load.
+    """
+    try:
+        key = _regeneration_revision_cache_key(session)
+    except Exception:
+        key = None
+    if key is None:
+        return None, _REGENERATION_REVISION_CACHE_MISS
+    with _regeneration_revision_cache_lock:
+        entry = _regeneration_revision_cache.get(key[0])
+        if entry is not None and entry.get("key") == key:
+            _regeneration_revision_cache.move_to_end(key[0], last=True)
+            return key, entry["revision"]
+    return key, _REGENERATION_REVISION_CACHE_MISS
+
+
+def _regeneration_revision_cache_remember(cache_key, revision):
+    """Record the authority verdict under the watermark the lookup probed with.
+
+    ``revision`` may be None: a declined verdict is a real, reusable result.
+    """
+    if cache_key is None:
+        return
+    with _regeneration_revision_cache_lock:
+        _regeneration_revision_cache[cache_key[0]] = {
+            "key": cache_key,
+            "revision": revision,
+        }
+        _regeneration_revision_cache.move_to_end(cache_key[0], last=True)
+        while len(_regeneration_revision_cache) > _REGENERATION_REVISION_CACHE_MAX:
+            _regeneration_revision_cache.popitem(last=False)
+
+
 def _state_db_rows_fingerprint(rows) -> str | None:
     """Content fingerprint of the state.db display rows, or None on failure."""
     try:
@@ -15177,15 +15325,18 @@ def _handle_get_impl(handler, parsed) -> bool:
                 and not _truncated
                 and (not raw.get("is_cli_session") or imported_turn_marker)
             ):
-                from api.session_ops import regeneration_authority, regeneration_state
-                canonical_state = regeneration_state(s)
-                revision = regeneration_authority(
-                    s,
-                    rows=canonical_state[0],
-                    context=canonical_state[1],
-                    full_transcript=True,
-                    canonical_state=canonical_state,
-                )
+                _regen_key, revision = _regeneration_revision_cache_lookup(s)
+                if revision is _REGENERATION_REVISION_CACHE_MISS:
+                    from api.session_ops import regeneration_authority, regeneration_state
+                    canonical_state = regeneration_state(s)
+                    revision = regeneration_authority(
+                        s,
+                        rows=canonical_state[0],
+                        context=canonical_state[1],
+                        full_transcript=True,
+                        canonical_state=canonical_state,
+                    )
+                    _regeneration_revision_cache_remember(_regen_key, revision)
                 if revision:
                     raw["regeneration_revision"] = revision
             redact = redact_session_data(raw)
