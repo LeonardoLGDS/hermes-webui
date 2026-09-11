@@ -8819,17 +8819,38 @@ def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
 # waits here instead of returning from serve_forever(); daemon workers keep
 # running while the main thread waits, so a normal turn can finish and persist.
 #
-# WHY BOUNDED: systemd's default TimeoutStopSec is 90s and its final action is
-# SIGKILL, which would recreate the very marker this drain prevents. A 45s
-# default covers typical turns with a guaranteed clean-stop margin;
-# HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS overrides it. The override is clamped to
-# _SHUTDOWN_DRAIN_MAX_SECONDS so no setting can push the stop past the stop
-# budget (the remaining explicit drains still get room) and manufacture a
-# SIGKILL. A non-positive/invalid value disables the wait → today's behaviour.
+# WHY BOUNDED: systemd's TimeoutStopSec is the wall this drain must stay inside
+# and its final action is SIGKILL, which would recreate the very marker this
+# drain prevents. A 45s default covers typical turns with a guaranteed
+# clean-stop margin; HERMES_WEBUI_SHUTDOWN_DRAIN_SECONDS overrides it. The
+# override is clamped to _SHUTDOWN_DRAIN_MAX_SECONDS so no setting can push the
+# stop past the stop budget (the remaining explicit drains still get room) and
+# manufacture a SIGKILL. A non-positive/invalid value disables the wait →
+# today's behaviour.
 _SHUTDOWN_DRAIN_DEFAULT_SECONDS = 45.0
-# 90s systemd budget − 30s memory-commit drain (drain_all_on_shutdown) − 5s
-# teardown margin.
+# The clamp is paired against the systemd unit's REAL stop budget now, not the
+# 90s default this comment used to assume:
+#   /home/ops/.config/systemd/user/hermes-webui-home.service:34 TimeoutStopSec=60
+# (raised from 15s on 2026-09-11). 60s budget − 30s memory-commit drain
+# (drain_all_on_shutdown) − 5s teardown margin ⇒ 55s clamp. Tonight's exhibit
+# (2026-09-11 17:33:52, unit TimeoutStopSec=15): systemd SIGKILLed a waiting
+# drain mid-wait, so its outcome line never appeared and turns longer than ~13s
+# were unprotected. At 60s the 45s default always finishes and logs first.
 _SHUTDOWN_DRAIN_MAX_SECONDS = 55.0
+# Drift guard (R116): the unit budget must clear the default drain bound by this
+# margin or a waiting drain is racing the SIGKILL again. The reference is the
+# DEFAULT bound (45s), not the 55s clamp, so the documented 60s pairing stays
+# silent; an explicit operator env override beyond 45s is their own trade-off.
+# Tonight's silent mismatch (unit 15s vs a 45s bound) survived two rounds with
+# no outcome line to show for it because nothing compared the numbers.
+_SHUTDOWN_DRAIN_BUDGET_MARGIN_SECONDS = 10.0
+# The unit whose effective TimeoutStopUSec the startup drift check reads; the
+# path is named in the warning so the operator knows what to raise.
+_SHUTDOWN_UNIT_NAME = "hermes-webui-home.service"
+_SHUTDOWN_UNIT_PATH = "~/.config/systemd/user/hermes-webui-home.service"
+# The drift-check systemctl query must never delay startup: a fraction of a
+# second, then give up (fail-open).
+_SYSTEMCTL_QUERY_TIMEOUT_SECONDS = 0.5
 # Poll while runs are live; settle-recheck once after the registry empties.
 # The settle covers the route→worker window: a route registers its STREAMS
 # entry before it spawns the worker (api/routes.py), so "empty" could be a
@@ -8932,6 +8953,140 @@ def shutdown_drain_seconds() -> float:
         )
         return _SHUTDOWN_DRAIN_MAX_SECONDS
     return seconds
+
+
+def _parse_systemd_time_seconds(value) -> float | None:
+    """Parse a systemd timespan (``15s``, ``1min 30s``, ``infinity``) to seconds.
+
+    Returns ``math.inf`` for ``infinity`` and for a disabled/zero budget
+    (systemd treats 0 as "no timeout"), or ``None`` when the value cannot be
+    parsed. The caller treats ``None`` as fail-open: log at DEBUG and continue,
+    because this sits on the startup path (R116).
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    # `systemctl show -p X --value` prints the bare value; older systemctl
+    # ignores --value and prints `X=value`, so tolerate both forms.
+    if "=" in text:
+        text = text.split("=", 1)[1].strip()
+    if text.lower() in ("infinity", "infinite"):
+        return math.inf
+    # A bare integer is a raw microsecond count (older systemctl behavior).
+    if re.fullmatch(r"\d+", text):
+        usec = int(text)
+        return math.inf if usec <= 0 else usec / 1_000_000.0
+    total = 0.0
+    matched = False
+    for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(us|ms|s|min|h|d)", text):
+        matched = True
+        total += float(number) * {
+            "us": 1e-6,
+            "ms": 1e-3,
+            "s": 1.0,
+            "min": 60.0,
+            "h": 3600.0,
+            "d": 86400.0,
+        }[unit]
+    if not matched:
+        return None
+    return math.inf if total <= 0 else total
+
+
+def systemd_stop_budget_seconds(unit: str = _SHUTDOWN_UNIT_NAME) -> float | None:
+    """Resolve a systemd user unit's effective stop budget in seconds, else None.
+
+    WHY fail-open (R116): this runs on the startup path. A missing systemctl, a
+    non-user session, or an unparsable value must never delay or block boot, so
+    every failure degrades to a DEBUG line and ``None``. The query is bounded to
+    a fraction of a second so a wedged systemctl cannot stall startup.
+    """
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "TimeoutStopUSec", "--value", unit],
+            capture_output=True,
+            text=True,
+            timeout=_SYSTEMCTL_QUERY_TIMEOUT_SECONDS,
+        )
+    except Exception:
+        logger.debug("Could not query systemd stop budget for %s", unit, exc_info=True)
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        logger.debug(
+            "systemctl stop-budget query failed for %s (rc=%s)",
+            unit,
+            getattr(proc, "returncode", None),
+        )
+        return None
+    return _parse_systemd_time_seconds(getattr(proc, "stdout", ""))
+
+
+def warn_if_drain_exceeds_stop_budget(
+    *,
+    resolver=None,
+    unit: str = _SHUTDOWN_UNIT_NAME,
+    unit_path: str = _SHUTDOWN_UNIT_PATH,
+    drain_bound_seconds: float | None = None,
+    margin_seconds: float = _SHUTDOWN_DRAIN_BUDGET_MARGIN_SECONDS,
+) -> bool:
+    """Warn when the unit's stop budget is too small for the shutdown drain.
+
+    WHY this exists (R116): tonight's mismatch (unit ``TimeoutStopSec=15`` vs a
+    45s drain bound) was silent for two rounds. At 17:33:52 the unit SIGKILLed
+    the waiting drain — its ``[shutdown-drain] outcome=...`` line never appeared
+    — and nothing had ever compared the two numbers. This startup check makes
+    any future drift (unit change or bound change) immediately visible instead
+    of silently eating the drain. Fail-open: an unknown or unparsable budget
+    only DEBUGs; startup is never blocked.
+
+    ``resolver`` is injectable (tests pass a stub); it defaults to
+    :func:`systemd_stop_budget_seconds`. Returns True when the warning fired.
+    """
+    if resolver is None:
+        resolver = systemd_stop_budget_seconds
+    try:
+        budget = resolver()
+    except Exception:
+        logger.debug(
+            "Stop-budget drift check could not resolve the unit budget",
+            exc_info=True,
+        )
+        return False
+    if budget is None:
+        logger.debug("Stop budget unknown for %s; skipping drain drift check", unit)
+        return False
+    try:
+        budget = float(budget)
+    except (TypeError, ValueError):
+        logger.debug(
+            "Stop budget %r for %s is not a number; skipping drain drift check",
+            budget,
+            unit,
+        )
+        return False
+    if not math.isfinite(budget):
+        return False
+    if drain_bound_seconds is None:
+        drain_bound_seconds = _SHUTDOWN_DRAIN_DEFAULT_SECONDS
+    try:
+        needed = float(drain_bound_seconds) + float(margin_seconds)
+    except (TypeError, ValueError):
+        return False
+    if budget < needed:
+        logger.warning(
+            "Shutdown drain may be SIGKILLed: systemd stop budget for %s is "
+            "%.0fs, below the drain bound %.0fs + %.0fs margin (%.0fs). Raise "
+            "TimeoutStopSec in %s so a waiting drain returns and logs before "
+            "the SIGKILL.",
+            unit,
+            budget,
+            drain_bound_seconds,
+            margin_seconds,
+            needed,
+            unit_path,
+        )
+        return True
+    return False
 
 
 def _in_flight_run_snapshot() -> dict:

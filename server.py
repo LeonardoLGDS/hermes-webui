@@ -672,6 +672,19 @@ def main() -> None:
 
     fix_credential_permissions()
 
+    # R116: fail-open drift check between the shutdown-drain bound
+    # (api/streaming.py) and this unit's real stop budget. Tonight
+    # (2026-09-11 17:33:52) the unit's TimeoutStopSec=15 SIGKILLed a waiting
+    # drain before it could log its outcome line, and the mismatch was silent
+    # for two rounds because nothing compared the numbers. The check queries
+    # `systemctl --user show -p TimeoutStopUSec` under a sub-second timeout and
+    # never blocks startup.
+    try:
+        from api.streaming import warn_if_drain_exceeds_stop_budget
+        warn_if_drain_exceeds_stop_budget()
+    except Exception:
+        logger.debug("Shutdown-drain stop-budget drift check unavailable", exc_info=True)
+
     try:
         from api.models import _active_state_db_path
         from api.session_recovery import recover_all_sessions_on_startup
