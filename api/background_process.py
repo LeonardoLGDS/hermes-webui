@@ -704,7 +704,7 @@ def _build_payload(evt: dict, session_id: str) -> dict:
     title = evt.get("goal") if is_delegation else evt.get("command")
     title = str(title or "").split("\n")[0].strip()
     if title:
-        payload["title"] = _truncate(title, 200)
+        payload["title"] = title[:200]
     if is_delegation:
         payload["status"] = evt.get("status")
     else:
