@@ -271,14 +271,16 @@ def test_emit_uses_new_event_name_with_trimmed_payload_and_event_id(monkeypatch)
     )
 
     payload = payloads[0]
-    # Minimal shape per maintainer (R2 §Q1).
     expected_required = {"session_id", "task_id", "completed_at", "event_id"}
-    allowed = expected_required | {"summary"}
+    allowed = expected_required | {"summary", "task_type", "title", "exit_code"}
     assert expected_required <= set(payload), f"missing required keys: {payload}"
     assert set(payload) <= allowed, f"unexpected keys in trimmed payload: {payload}"
+    assert payload["task_type"] == "process"
+    assert payload["title"] == evt["command"]
+    assert payload["exit_code"] == evt["exit_code"]
 
     # Dropped keys must NOT be present.
-    for dropped in ("command", "exit_code", "type", "stdout_preview", "wakeup_prompt", "emitted_at", "process_id"):
+    for dropped in ("command", "type", "stdout_preview", "wakeup_prompt", "emitted_at", "process_id"):
         assert dropped not in payload, f"{dropped!r} should be dropped by T1 trim"
 
     # Field-rename invariants:

@@ -672,10 +672,9 @@ def format_wakeup_prompt(evt: object) -> str | None:
 def _build_payload(evt: dict, session_id: str) -> dict:
     """Build the SSE data payload.
 
-    Shape per maintainer decision on PR #2242 (R2 §Q1):
-        ``{session_id, task_id, completed_at, summary?, event_id}``
-    Minimal by design — consumers re-fetch task detail by ``task_id`` if
-    they need ``command`` / ``exit_code`` / ``stdout_preview`` etc.
+    The original identity/summary fields are retained. Additive ``task_type``
+    and ``title`` identify the card; delegation ``status`` or process
+    ``exit_code`` carries the outcome without parsing display text.
 
     - ``task_id``: the background process id (registry uuid). Stable across
       the process's lifetime; was previously surfaced as ``process_id``.
@@ -700,6 +699,16 @@ def _build_payload(evt: dict, session_id: str) -> dict:
         "completed_at": time.time(),
         "event_id": uuid.uuid4().hex,
     }
+    is_delegation = evt.get("type") == "async_delegation"
+    payload["task_type"] = "delegation" if is_delegation else "process"
+    title = evt.get("goal") if is_delegation else evt.get("command")
+    title = str(title or "").split("\n")[0].strip()
+    if title:
+        payload["title"] = _truncate(title, 200)
+    if is_delegation:
+        payload["status"] = evt.get("status")
+    else:
+        payload["exit_code"] = evt.get("exit_code")
     # Best-effort optional summary for the concise event card.
     try:
         if evt.get("type", "completion") == "completion" and process_id:
@@ -796,7 +805,7 @@ def bg_status_for_session(session_id: str) -> dict:
                 "id": row.get("session_id") or "",
                 "title": (row.get("command") or "").split("\n")[0].strip()
                 or "background process",
-                "state": "failed" if exited and exit_code else "done" if exited else "running",
+                "state": "done" if exited and exit_code == 0 else "failed" if exited else "running",
                 "exit_code": exit_code,
                 "started_at": row.get("started_at"),
             }

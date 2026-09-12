@@ -617,14 +617,11 @@ def test_real_completion_event_shape_routes_to_session_channel():
         assert data["session_id"] == webui_sid
         assert data["task_id"] == proc_id
         assert data.get("event_id"), "emitter must stamp event_id (Q4 contract)"
-        # Per the Q1 minimal-payload trim settled in #2242, the SSE payload
-        # no longer carries ``wakeup_prompt`` (or ``command`` / ``exit_code``).
-        # The optional ``summary`` field is now the only human-readable
-        # surface; when the synthetic wakeup body is available the emitter
-        # derives a short first-line summary from it.
         assert "wakeup_prompt" not in data
         assert "command" not in data
-        assert "exit_code" not in data
+        assert data["exit_code"] == 0
+        assert data["task_type"] == "process"
+        assert data["title"] == "pytest -q"
         summary = data.get("summary")
         if summary is not None:
             assert isinstance(summary, str)

@@ -470,6 +470,11 @@ function bgExitCode(value) {
   return code === undefined ? undefined : Math.trunc(code);
 }
 
+function bgTaskType(value, id) {
+  if (value === 'delegation' || value === 'process') return value;
+  return id.startsWith('deleg_') ? 'delegation' : 'process';
+}
+
 function bgItemFromProcess(process, now) {
   const id = bgProcessId(process);
   if (!id) return null;
@@ -480,10 +485,13 @@ function bgItemFromProcess(process, now) {
     state = 'failed';
   }
 
+  const taskType = bgTaskType(process.task_type, id);
   const item = {
     id,
     type: 'background',
-    title: str(process.title) || str(process.command) || id,
+    taskType,
+    title: str(process.title) || str(process.command)
+      || (taskType === 'delegation' ? 'Background delegation' : 'Background process'),
     state,
     updatedAt: num(process.updated_at) || now,
   };
@@ -605,14 +613,13 @@ function ingestBgTaskComplete(data, sid, completion) {
   if (!sessionId || !id) return null;
 
   const known = completion && typeof completion === 'object' ? completion : {};
-  // The trimmed bg_task_complete wire frame omits display metadata; S6 can
-  // pass the parsed title/exitCode alongside it. Missing exit information also
-  // fails closed as a failure rather than pretending the process succeeded.
   const rawExit = data.exit_code !== undefined
     ? data.exit_code
     : (data.exitCode !== undefined ? data.exitCode : known.exitCode);
   const exitCode = bgExitCode(rawExit);
-  const state = exitCode === 0 ? 'done' : 'failed';
+  const outcome = asBgState(data.status || known.status);
+  const state = exitCode !== undefined ? (exitCode === 0 ? 'done' : 'failed')
+    : (outcome === 'done' ? 'done' : 'failed');
   const now = Date.now();
 
   let items = _bgProcsBySession.get(sessionId);
@@ -621,11 +628,15 @@ function ingestBgTaskComplete(data, sid, completion) {
     _bgProcsBySession.set(sessionId, items);
   }
   const previous = items.get(id);
+  const taskType = bgTaskType(data.task_type || known.taskType
+    || (previous && previous.taskType), id);
   const item = {
     id,
     type: 'background',
+    taskType,
     title: str(data.title) || str(data.command) || str(known.title)
-      || (previous ? previous.title : '') || id,
+      || (previous ? previous.title : '')
+      || (taskType === 'delegation' ? 'Background delegation' : 'Background process'),
     state,
     updatedAt: num(data.completed_at) || now,
   };

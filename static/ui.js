@@ -18908,7 +18908,7 @@ function buildToolCard(tc){
       ${subagentInfoParts.length?`<div class="tool-card-subagent-info">${subagentInfoParts.join('')}</div>`:''}
     </div>`;
   row._tcData = tc;
-  if(isSubagent&&tc.args){
+  if((isSubagent||toolKind==='shell')&&tc.args){
     // WHY: bg_status/bg_task_complete need a durable task identity to patch the matching message-log card idempotently.
     const runStatusId=tc.args.subagent_id||tc.args.delegation_id||tc.args.task_id||tc.args.process_id||'';
     if(runStatusId) row.dataset.runStatusId=String(runStatusId);
@@ -18937,12 +18937,14 @@ function syncBackgroundToolRunCards(items,sessionId){
       const state=String(item.state||'failed');
       const status=state==='running'?'running':(state==='done'?'completed':'failed');
       const progress=String(item.output||'').trim()||(status==='running'?'Running in background':'');
+      const isDelegation=item.taskType==='delegation'||(!item.taskType&&runId.startsWith('deleg_'));
+      const title=String(item.title||(isDelegation?'Background delegation':'Background process'));
       const toolCall={
-        name:'delegate_task',
+        name:isDelegation?'delegate_task':'terminal',
         tid:runId,
         done:status!=='running',
         is_error:status==='failed',
-        args:{task_id:runId,goal:String(item.title||runId),status},
+        args:isDelegation?{task_id:runId,goal:title,status}:{task_id:runId,command:title,status},
         preview:progress,
       };
       const selector=`.tool-card-row[data-run-status-id="${CSS.escape(runId)}"]`;

@@ -4,10 +4,11 @@ This file replaces the legacy ``test_process_complete_wakeup.py`` after the
 R2 §Q1 / Q4 contract update with the maintainer:
 
   - Q1: the canonical SSE event is now ``bg_task_complete`` carrying the
-        minimal ``{session_id, task_id, completed_at, summary?, event_id}``
-        payload (the legacy ``process_complete`` name is dual-emitted under
+        identity ``{session_id, task_id, completed_at, summary?, event_id}``
+        plus additive outcome/card metadata (see docs/background-card-outcomes.md).
+        The legacy ``process_complete`` name is dual-emitted under
         PR (a) only as a 1-PR-cycle compatibility shim and is removed in
-        PR (b)).
+        PR (b).
   - Q4: each emit must carry a fresh server-side ``event_id`` so the WebUI
         can build a consumer-side TTL ring buffer for cross-disconnect
         dedupe in a follow-up PR.
@@ -112,18 +113,20 @@ def test_bg_task_complete_wakeup_emits_canonical_event_with_event_id(monkeypatch
     payload = canonical_payloads[0]
 
     expected_required = {"session_id", "task_id", "completed_at", "event_id"}
-    allowed = expected_required | {"summary"}
+    allowed = expected_required | {"summary", "task_type", "title", "exit_code"}
     assert expected_required <= set(payload), (
         f"missing required keys in bg_task_complete payload: {payload}"
     )
     assert set(payload) <= allowed, (
         f"unexpected keys in trimmed bg_task_complete payload: {payload}"
     )
+    assert payload["task_type"] == "process"
+    assert payload["title"] == evt["command"]
+    assert payload["exit_code"] == evt["exit_code"]
 
     # The legacy/dropped keys must NOT survive the T1 trim.
     for dropped in (
         "command",
-        "exit_code",
         "type",
         "stdout_preview",
         "wakeup_prompt",
