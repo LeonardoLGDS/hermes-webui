@@ -7704,6 +7704,8 @@ def _agent_result_terminal_failure(result) -> bool:
     """Return True for agent results that must not be finalized as done."""
     if not isinstance(result, dict):
         return False
+    if result.get('interrupted') or result.get('completed') is False:
+        return True
     status = str(result.get('status') or result.get('state') or '').strip().lower()
     if status in {'failed', 'error', 'partial', 'compression_exhausted'}:
         return True
@@ -11557,7 +11559,9 @@ def _run_agent_streaming(
                     _previous_context_messages,
                     msg_text,
                 )
-                _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
+                _last_err = result.get('failure_notice') or getattr(agent, '_last_error', None) or result.get('error') or ''
+                if not _last_err and _agent_result_terminal_failure(result):
+                    _last_err = str(result.get('final_response') or '').strip()
                 # #5940: if the Agent aborted on a non-retryable provider error
                 # (captured from its lifecycle status_callback) but left no error on
                 # the result/agent, use the captured message so the classifier can
