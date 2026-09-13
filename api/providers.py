@@ -1699,13 +1699,6 @@ class _AccountUsageProbeWorker:
     def _close_process(proc: subprocess.Popen[str] | None) -> None:
         if proc is None:
             return
-        for stream_name in ("stdin", "stdout"):
-            stream = getattr(proc, stream_name, None)
-            try:
-                if stream is not None:
-                    stream.close()
-            except Exception:
-                pass
         try:
             if proc.poll() is None:
                 proc.terminate()
@@ -1715,6 +1708,13 @@ class _AccountUsageProbeWorker:
                     proc.kill()
         except Exception:
             pass
+        for stream_name in ("stdin", "stdout"):
+            stream = getattr(proc, stream_name, None)
+            try:
+                if stream is not None:
+                    stream.close()
+            except Exception:
+                pass
 
     def fetch(self, provider: str, *, api_key: str | None = None) -> Any:
         if not self._lock.acquire(blocking=False):
