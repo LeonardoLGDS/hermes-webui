@@ -248,7 +248,14 @@ class GatewayWatcher:
         with self._sub_lock:
             for q in self._subscribers:
                 try:
-                    q.put(None)  # sentinel
+                    try:
+                        q.put_nowait(None)
+                    except queue.Full:
+                        try:
+                            q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        q.put_nowait(None)
                 except Exception:
                     logger.debug("Failed to send sentinel to subscriber")
         if self._thread:
