@@ -15935,6 +15935,19 @@ def _handle_get_impl(handler, parsed) -> bool:
 
     if parsed.path == "/api/chat/cancel":
         stream_id = parse_qs(parsed.query).get("stream_id", [""])[0]
+        cancel_delegate = cancel_stream
+        try:
+            from agent.interrupt_origin import call_with_interrupt_origin, emit_interrupt_origin
+            from api.streaming import _interrupt_identity
+
+            cancel_reason = 'http_cancel'
+            emit_interrupt_origin(
+                logger, _interrupt_identity(stream_id), phase='http_received',
+                reason=cancel_reason, handler=handler,
+            )
+            cancel_delegate = lambda sid: call_with_interrupt_origin(cancel_stream, sid, handler=handler, reason=cancel_reason)
+        except Exception:
+            pass
         if not stream_id:
             return bad(handler, "stream_id required")
         if not _stream_id_visible_to_request_profile(handler, stream_id):
@@ -15975,10 +15988,10 @@ def _handle_get_impl(handler, parsed) -> bool:
         from api.runtime_adapter import LegacyJournalRuntimeAdapter, runtime_adapter_enabled
 
         if runtime_adapter_enabled():
-            adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_stream)
+            adapter = LegacyJournalRuntimeAdapter(cancel_delegate=cancel_delegate)
             cancelled = adapter.cancel_run(stream_id).accepted
         else:
-            cancelled = cancel_stream(stream_id)
+            cancelled = cancel_delegate(stream_id)
         return j(handler, {"ok": True, "cancelled": cancelled, "stream_id": stream_id})
 
     if parsed.path == "/api/chat/stream":

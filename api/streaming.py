@@ -9327,11 +9327,12 @@ def _run_agent_streaming(
         logger.debug("Failed to initialize run journal for stream %s", stream_id, exc_info=True)
     if not ephemeral:
         try:
-            append_turn_journal_event_for_stream(
+            worker_event = append_turn_journal_event_for_stream(
                 session_id,
                 stream_id,
                 {"event": "worker_started", "created_at": time.time()},
             )
+            update_active_run(stream_id, turn_id=worker_event.get('turn_id'))
         except Exception:
             logger.debug("Failed to append worker_started turn journal event", exc_info=True)
     s = None
@@ -11091,6 +11092,7 @@ def _run_agent_streaming(
 
             # Store agent instance for cancel/interrupt propagation
             with STREAMS_LOCK:
+                _bind_interrupt_identity(agent, stream_id)
                 AGENT_INSTANCES[stream_id] = agent
                 # Check if cancel was requested during agent initialization
                 if stream_id in CANCEL_FLAGS and CANCEL_FLAGS[stream_id].is_set():
@@ -11815,6 +11817,7 @@ def _run_agent_streaming(
                                 _agent_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                             agent = _AIAgent(**_agent_kwargs)
                             with STREAMS_LOCK:
+                                _bind_interrupt_identity(agent, stream_id)
                                 AGENT_INSTANCES[stream_id] = agent
                             from api.config import SESSION_AGENT_CACHE as _SAC, SESSION_AGENT_CACHE_LOCK as _SAC_L
                             with _SAC_L:
@@ -13114,6 +13117,7 @@ def _run_agent_streaming(
                         _heal_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
                     _heal_agent = _AIAgent(**_heal_kwargs)
                     with STREAMS_LOCK:
+                        _bind_interrupt_identity(_heal_agent, stream_id)
                         AGENT_INSTANCES[stream_id] = _heal_agent
                     from api.config import SESSION_AGENT_CACHE as _SAC2, SESSION_AGENT_CACHE_LOCK as _SAC2_L
                     with _SAC2_L:
@@ -13638,6 +13642,41 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                        "stream_id": active_stream_id})
 
 
+def _interrupt_identity(stream_id):
+    identity = {
+        'session_id': None, 'turn_id': None, 'agent_turn_id': None,
+        'run_id': None, 'stream_id': None,
+    }
+    try:
+        from api import config as live_config
+
+        agent = AGENT_INSTANCES.get(stream_id)
+        with live_config.ACTIVE_RUNS_LOCK:
+            active = dict(live_config.ACTIVE_RUNS.get(stream_id) or {})
+        if not active and agent is None and stream_id not in STREAMS:
+            return identity
+        identity.update(run_id=stream_id, stream_id=stream_id)
+        context = getattr(agent, '_interrupt_origin_context', {})
+        identity.update(
+            session_id=stream_owner_session_id(stream_id) or active.get('session_id') or getattr(agent, 'session_id', None),
+            turn_id=active.get('turn_id') or context.get('turn_id'),
+            agent_turn_id=getattr(agent, '_current_turn_id', None),
+        )
+    except Exception:
+        pass
+    return identity
+
+
+def _bind_interrupt_identity(agent, stream_id):
+    try:
+        identity = _interrupt_identity(stream_id)
+        agent._interrupt_origin_context = {
+            key: identity[key] for key in ('turn_id', 'run_id', 'stream_id')
+        }
+    except Exception:
+        pass
+
+
 def cancel_stream(stream_id: str) -> bool:
     """Signal an in-flight stream to cancel. Returns True if work was found.
 
@@ -13752,7 +13791,14 @@ def cancel_stream(stream_id: str) -> bool:
     # fall back to a fresh lookup for the ACTIVE_RUNS-only path (stream absent).
     flag = _snap_flag if _snap_flag is not None else cancel_flags.get(stream_id)
     if flag:
+        previous = flag.is_set()
         flag.set()
+        try:
+            from agent.interrupt_origin import emit_interrupt_origin
+
+            emit_interrupt_origin(logger, _interrupt_identity(stream_id), phase='flag_set', reason='cancel_stream', previous=previous)
+        except Exception:
+            pass
 
     # Interrupt the AIAgent instance to stop tool execution. Use the
     # lock-snapshot agent when the stream was present; otherwise fall back to
@@ -13768,6 +13814,7 @@ def cancel_stream(stream_id: str) -> bool:
             pass
     if agent:
         try:
+            _bind_interrupt_identity(agent, stream_id)
             agent.interrupt("Cancelled by user")
         except Exception as e:
             # Log but don't block the cancel flow
