@@ -5,6 +5,10 @@ the existing in-process streaming path without changing execution ownership.
 """
 from __future__ import annotations
 
+try:  # POSIX only: run-journal leases need fcntl.flock.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX: leases unavailable, trimmer retains
+    fcntl = None
 import json
 import os
 import re
@@ -76,6 +80,260 @@ def _run_path(session_id: str, run_id: str, session_dir: Path | None = None) -> 
     rid = _validate_id(run_id, "run_id")
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
     return root / RUN_JOURNAL_DIR_NAME / sid / f"{rid}.jsonl"
+
+
+# --- run-journal writer leases (protocol: run-journal-lease-v1) -------------
+# Purpose: make run liveness visible to ANOTHER PROCESS.  The append path opens
+# ``_run_journal/.leases/<sid>~<run>.lease`` and holds ``fcntl.LOCK_SH`` on it
+# for the whole run, including long idle gaps between appends.  A retention
+# pass proves "no live writer" by taking ``LOCK_EX|LOCK_NB`` on that same file
+# (kit/retention.py + kit/lease_protocol.py).  The kernel drops an flock when
+# the holding process exits, so a crashed writer can never leave a lease that
+# looks live, and pid reuse cannot forge one.
+#
+# Fail-closed asymmetry: publication here is BEST EFFORT (a failure must never
+# break an append), while the reader treats a missing/unreadable lease as
+# "cannot prove absence" and RETAINS the entry.  A lease is created on the
+# first append for a run and released when the run's relay-close event is
+# written (the same set as SSE_RELAY_CLOSE_EVENTS; ``done`` is excluded because
+# title generation and ``stream_end`` follow it).
+RUN_JOURNAL_LEASE_PROTOCOL = "run-journal-lease-v1"
+RUN_JOURNAL_LEASE_DIR_NAME = ".leases"
+RUN_JOURNAL_LEASE_PROTOCOL_FILE = "PROTOCOL.json"
+RUN_JOURNAL_LEASE_SEPARATOR = "~"
+RUN_JOURNAL_LEASE_HELD = "held"
+RUN_JOURNAL_LEASE_RELEASED = "released"
+# key -> (open file object, Path); the open object is what holds the flock.
+_RUN_LEASES: dict[str, Any] = {}
+_RUN_LEASES_LOCK = threading.Lock()
+
+
+def _boot_id() -> str | None:
+    """Stable per-boot identity, used to tell "same pid, different boot" apart."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id", "r", encoding="utf-8") as handle:
+            return handle.read().strip() or None
+    except OSError:
+        return None
+
+
+def _lease_root(session_dir: Path | None = None) -> Path:
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    return root / RUN_JOURNAL_DIR_NAME / RUN_JOURNAL_LEASE_DIR_NAME
+
+
+def run_lease_path(session_id: str, run_id: str, *, session_dir: Path | None = None) -> Path:
+    """Path of the lease that proves liveness for one (session, run) pair."""
+    sid = _validate_id(session_id, "session_id")
+    rid = _validate_id(run_id, "run_id")
+    return _lease_root(session_dir) / f"{sid}{RUN_JOURNAL_LEASE_SEPARATOR}{rid}.lease"
+
+
+def _lease_payload(session_id: str, run_id: str, state: str, now: float, pid: int) -> dict:
+    return {
+        "protocol": RUN_JOURNAL_LEASE_PROTOCOL,
+        "session_id": str(session_id),
+        "run_id": str(run_id),
+        "pid": int(pid),
+        "boot_id": _boot_id(),
+        "state": str(state),
+        "opened_at": float(now),
+        "heartbeat_at": float(now),
+    }
+
+
+def register_run_lease_protocol(
+    *,
+    session_dir: Path | None = None,
+    installed_at: float | None = None,
+) -> Path | None:
+    """Publish the once-per-journal protocol marker (idempotent, best effort).
+
+    ``installed_at`` is the boundary a retention pass uses for its coverage
+    gate: runs *written after* this instant must carry a lease record, because
+    a writer that ran then had the protocol available.
+    """
+    try:
+        directory = _lease_root(session_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        marker = directory / RUN_JOURNAL_LEASE_PROTOCOL_FILE
+        if marker.exists():
+            return marker
+        payload = {
+            "protocol": RUN_JOURNAL_LEASE_PROTOCOL,
+            "installed_at": float(installed_at if installed_at is not None else time.time()),
+            "pid": os.getpid(),
+            "writer": "api/run_journal.py",
+        }
+        temp = marker.with_name(marker.name + f".tmp.{os.getpid()}")
+        with temp.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, marker)
+        _fsync_parent_dir(marker)
+        return marker
+    except OSError:
+        return None
+
+
+def acquire_run_lease(
+    session_id: str,
+    run_id: str,
+    *,
+    session_dir: Path | None = None,
+    pid: int | None = None,
+    state: str = RUN_JOURNAL_LEASE_HELD,
+    now: float | None = None,
+) -> Path | None:
+    """Hold a shared lease for one run; returns its path, or None if unavailable.
+
+    Never raises: a lease problem must not break the append path.  Returns the
+    existing path when this process already holds the lease.
+    """
+    if fcntl is None:
+        return None
+    try:
+        register_run_lease_protocol(session_dir=session_dir)
+        path = run_lease_path(session_id, run_id, session_dir=session_dir)
+        key = str(path)
+        with _RUN_LEASES_LOCK:
+            existing = _RUN_LEASES.get(key)
+            if existing is not None and not existing[0].closed:
+                return path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+            handle = os.fdopen(descriptor, "r+b", buffering=0)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
+                payload = _lease_payload(session_id, run_id, state,
+                                         float(now if now is not None else time.time()),
+                                         int(pid if pid is not None else os.getpid()))
+                handle.seek(0)
+                handle.truncate()
+                handle.write((json.dumps(payload) + "\n").encode("utf-8"))
+                os.fsync(handle.fileno())
+            except OSError:
+                handle.close()
+                return None
+            _RUN_LEASES[key] = (handle, path)
+            return path
+    except Exception:
+        return None
+
+
+def release_run_lease(
+    session_id: str,
+    run_id: str,
+    *,
+    session_dir: Path | None = None,
+    state: str = RUN_JOURNAL_LEASE_RELEASED,
+    now: float | None = None,
+) -> bool:
+    """Mark a run's lease released and drop its flock. Best effort, never raises."""
+    try:
+        key = str(run_lease_path(session_id, run_id, session_dir=session_dir))
+    except Exception:
+        return False
+    if fcntl is None:
+        return False
+    with _RUN_LEASES_LOCK:
+        entry = _RUN_LEASES.pop(key, None)
+    if entry is None:
+        return False
+    handle = entry[0]
+    try:
+        payload = _lease_payload(session_id, run_id, state,
+                                 float(now if now is not None else time.time()), os.getpid())
+        handle.seek(0)
+        handle.truncate()
+        handle.write((json.dumps(payload) + "\n").encode("utf-8"))
+        os.fsync(handle.fileno())
+    except OSError:
+        pass
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        handle.close()
+    except OSError:
+        pass
+    return True
+
+
+def release_session_run_leases(session_id: str, *, session_dir: Path | None = None) -> int:
+    """Release every lease this process holds for one session (delete/clear path)."""
+    released = 0
+    for key in list(_RUN_LEASES.keys()):
+        name = Path(key).name
+        if not name.endswith(".lease"):
+            continue
+        stem = name[: -len(".lease")]
+        if RUN_JOURNAL_LEASE_SEPARATOR not in stem:
+            continue
+        sid, _, rid = stem.rpartition(RUN_JOURNAL_LEASE_SEPARATOR)
+        if sid != str(session_id):
+            continue
+        if release_run_lease(sid, rid, session_dir=session_dir):
+            released += 1
+    return released
+
+
+def iter_run_leases(*, session_dir: Path | None = None) -> list[Path]:
+    """Every lease record in the journal root, sorted by name."""
+    try:
+        return sorted(item for item in _lease_root(session_dir).iterdir() if item.name.endswith(".lease"))
+    except OSError:
+        return []
+
+
+def read_run_lease(path: Path) -> dict | None:
+    """Parse one lease record; returns None (not an exception) when unusable."""
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(record, dict) or record.get("protocol") != RUN_JOURNAL_LEASE_PROTOCOL:
+        return None
+    return record
+
+
+def publish_active_run_leases(
+    *,
+    session_dir: Path | None = None,
+    runs: Iterable[dict] | None = None,
+    now: float | None = None,
+) -> list[dict]:
+    """Adoption helper: take leases for runs already in flight at install time.
+
+    ``runs`` defaults to the live ``api.config.ACTIVE_RUNS`` rows (keys are
+    stream ids, which ARE run ids -- ``RunJournalWriter(session_id, stream_id)``
+    at api/streaming.py:9508).  Called by the install step, never automatically.
+    """
+    published: list[dict] = []
+    if runs is None:
+        rows: list[dict] = []
+        try:
+            from api import config as live_config
+
+            with live_config.ACTIVE_RUNS_LOCK:
+                rows = [dict(row or {}) for row in (live_config.ACTIVE_RUNS or {}).values()]
+        except Exception:
+            rows = []
+    else:
+        rows = [dict(row or {}) for row in runs]
+    for row in rows:
+        session_id = str(row.get("session_id") or "")
+        run_id = str(row.get("run_id") or row.get("stream_id") or "")
+        if not session_id or not run_id:
+            continue
+        path = acquire_run_lease(session_id, run_id, session_dir=session_dir, now=now)
+        published.append({"session_id": session_id, "run_id": run_id,
+                          "path": str(path) if path else None, "acquired": path is not None})
+    return published
 
 
 def _lock_for(path: Path) -> threading.Lock:
@@ -422,6 +680,9 @@ def append_run_event(
             "payload": payload,
         }
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Best effort: a failure here must never break an append, and a missing
+        # lease makes a retention pass retain this run (fail closed).
+        acquire_run_lease(session_id, run_id, session_dir=session_dir)
         created_file = not path.exists()
         line = json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
         fd = os.open(path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
@@ -430,6 +691,10 @@ def append_run_event(
             fh.flush()
             if _should_fsync_event(terminal_state):
                 os.fsync(fh.fileno())
+        if event_name in SSE_RELAY_CLOSE_EVENTS:
+            # Run finished: mark the lease released and drop its flock. ``done``
+            # is intentionally excluded (title generation and stream_end follow).
+            release_run_lease(session_id, run_id, session_dir=session_dir)
         _discard_cached_summary(path)
         if created_file:
             _fsync_parent_dir(path)
@@ -725,6 +990,8 @@ def delete_run_journal(session_id: str, *, session_dir: Path | None = None) -> b
     session_journal_dir = root / RUN_JOURNAL_DIR_NAME / sid
     if not session_journal_dir.exists():
         return False
+    # Drop this process's leases for the session before the directory goes away.
+    release_session_run_leases(session_id, session_dir=session_dir)
     shutil.rmtree(session_journal_dir, ignore_errors=True)
     removed = not session_journal_dir.exists()
     # Evict any writer locks the removed runs left behind. `_lock_for` keys are

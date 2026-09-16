@@ -42,6 +42,7 @@ this module routes them to the same listener so the frontend's single
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import threading
 import time
@@ -91,6 +92,26 @@ _EMIT_COALESCE_LOCK = threading.Lock()
 _LAST_EMIT_TS: dict[str, float] = {}
 _PENDING_EMIT_PAYLOADS: dict[str, dict] = {}
 _PENDING_EMIT_TIMERS: dict[str, threading.Timer] = {}
+
+# ── External-completion idle rail (durable discovery -> mailbox -> wakeup) ──
+# The drain tick services durable external-completion owners even when the
+# shared queue has nothing to give it. Discovery is bounded: one profile per
+# tick (cursor advances and wraps), at most _EXTERNAL_OWNERS_PER_PASS owners
+# per pass, and per-profile owner cursors so each pass resumes where the last
+# one stopped. Owners/profiles are always resolved from durable enrollment plus
+# the trusted profile resolver — never from queued payload text.
+_EXTERNAL_PROFILE_CACHE_TTL = 300.0
+_EXTERNAL_MAX_PROFILES = 32
+_EXTERNAL_OWNERS_PER_PASS = 8
+_EXTERNAL_IDLE_TICK_SECONDS = 1.0
+_EXTERNAL_DISCOVERY_LOCK = threading.Lock()
+_EXTERNAL_DISCOVERY_STATE: dict[str, Any] = {
+    'profiles': [],
+    'profiles_cached_at': 0.0,
+    'profile_index': 0,
+    'owner_cursor_by_profile': {},
+    'last_run': 0.0,
+}
 
 # ── Persistent per-session SSE channel (Option X) ──────────────────────────
 # SESSION_CHANNELS maps WebUI session_id -> SessionChannel. Each channel owns
@@ -1458,6 +1479,16 @@ def _process_one(evt: dict) -> None:
     """Route a single completion_queue event to the matching WebUI session."""
     from api import config as _cfg
 
+    # External-completion interception: ABOVE every legacy branch below.
+    # A queued external_completion_v1 event must never reach the generic
+    # async claim/ACK, unknown-route retry, stale-completion, or Option-Z
+    # machinery — those would claim it and start a non-external wakeup with a
+    # generic prompt. The durable native record stays the only authority and
+    # is left untouched here when the owner cannot be positively resolved.
+    if _is_external_completion_event(evt):
+        _process_external_completion_event(evt)
+        return
+
     # Hoist the process-registry import once per event: it was imported in
     # three separate blocks below (session_key recovery, env-immune owner
     # cross-check, upstream is_completion_consumed dedupe) on every completion
@@ -1931,6 +1962,576 @@ def _start_server_side_wakeup_turn(
     ).start()
 
 
+def _is_external_completion_event(evt: object) -> bool:
+    """True for a queued native external-completion event (never generic)."""
+    return (
+        isinstance(evt, dict)
+        and evt.get("type") == "async_delegation"
+        and isinstance(evt.get("external_completion_v1"), dict)
+    )
+
+
+def _bg_hermes_home_override(profile_home):
+    """Install the context-local Hermes home override for one profile call.
+
+    Returns ``(module, token)`` or None when the context API is unavailable.
+    The drain thread is shared by every WebUI session, so it must never mutate
+    ``os.environ``; a caller that cannot install the context-local override
+    must skip the profile-scoped call rather than silently binding the process
+    default database (PROFILE-CONTEXT.txt).
+    """
+    if not isinstance(profile_home, str) or not profile_home.startswith(os.sep):
+        return None
+    try:
+        import hermes_constants as _hc
+    except Exception:
+        return None
+    setter = getattr(_hc, "set_hermes_home_override", None)
+    resetter = getattr(_hc, "reset_hermes_home_override", None)
+    if not callable(setter) or not callable(resetter):
+        return None
+    try:
+        return _hc, setter(profile_home)
+    except Exception:
+        logger.debug("Failed to set bg Hermes home override", exc_info=True)
+        return None
+
+
+def _reset_bg_hermes_home_override(override_mod, override_token) -> None:
+    if override_mod is None:
+        return
+    try:
+        override_mod.reset_hermes_home_override(override_token)
+    except Exception:
+        logger.debug("Failed to reset bg Hermes home override", exc_info=True)
+
+
+def _profile_home_for_name(profile_name) -> Optional[str]:
+    """Absolute HERMES_HOME string for a profile name (PROFILE-RESOLVER)."""
+    try:
+        from api.profiles import get_hermes_home_for_profile
+        home = get_hermes_home_for_profile(profile_name)
+    except Exception:
+        return None
+    if home is None:
+        return None
+    try:
+        resolved = os.path.abspath(os.path.expanduser(str(home)))
+    except Exception:
+        return None
+    if not resolved.startswith(os.sep):
+        return None
+    return resolved
+
+
+def _external_completion_profiles() -> list:
+    """Trusted profile names for discovery, from existing helpers (cached)."""
+    try:
+        from tools.external_completion_release import enabled_profile_homes
+        allowed_homes = enabled_profile_homes(surface="webui")
+    except (ImportError, AttributeError, OSError):
+        return []
+    if not allowed_homes:
+        return []  # No schema touches or discovery in unenrolled profiles.
+    now = time.time()
+    with _EXTERNAL_DISCOVERY_LOCK:
+        cached = list(_EXTERNAL_DISCOVERY_STATE["profiles"])
+        cached_at = _EXTERNAL_DISCOVERY_STATE["profiles_cached_at"]
+    if cached and (now - cached_at) < _EXTERNAL_PROFILE_CACHE_TTL:
+        return [name for name in cached if _profile_home_for_name(name) in allowed_homes]
+    names = []
+    try:
+        from api.profiles import list_profiles_api
+        rows = list_profiles_api()
+    except Exception:
+        rows = []
+    if isinstance(rows, (list, tuple)):
+        for row in rows:
+            name = (
+                row.get("name") if isinstance(row, dict)
+                else getattr(row, "name", None)
+            )
+            if isinstance(name, str) and name.strip():
+                names.append(name.strip())
+    deduped = [name for name in sorted(set(names))
+               if _profile_home_for_name(name) in allowed_homes][:_EXTERNAL_MAX_PROFILES]
+    with _EXTERNAL_DISCOVERY_LOCK:
+        _EXTERNAL_DISCOVERY_STATE["profiles"] = deduped
+        _EXTERNAL_DISCOVERY_STATE["profiles_cached_at"] = now
+        cursors = _EXTERNAL_DISCOVERY_STATE["owner_cursor_by_profile"]
+        while len(cursors) > _EXTERNAL_MAX_PROFILES:
+            cursors.pop(next(iter(cursors)))
+    return deduped
+
+
+def _external_bindings_for_session(session_id, profile_home) -> Optional[dict]:
+    """Explicit bindings only: authenticated session + resolved profile home."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(profile_home, str) or not profile_home.startswith(os.sep):
+        return None
+    try:
+        from tools import async_delegation as _native
+        policy_hash = _native.EXTERNAL_COMPLETION_POLICY_HASH
+    except Exception:
+        return None
+    route = {"platform": "webui", "chat_id": session_id, "session_key": session_id}
+    try:
+        from tools.external_completion_release import authorize_owner
+        release_hash = authorize_owner(
+            session_id=session_id, profile_home=profile_home, route=route,
+            surface="webui", source_name="api.background_process", source_path=__file__,
+        )
+    except (ImportError, AttributeError, OSError):
+        return None
+    if release_hash is None:
+        return None
+    return {"owner_session_id": session_id, "owner_profile": profile_home,
+            "route": route, "policy_hash": policy_hash, "release_hash": release_hash}
+
+
+def _external_session_is_wakable(session) -> bool:
+    """False for missing/archived/compression-snapshot sessions.
+
+    A deleted or rotated-away chat must not be resurrected by a background
+    completion; those rows stay durable-pending for an explicit user turn.
+    """
+    if session is None:
+        return False
+    if not str(getattr(session, "session_id", "") or ""):
+        return False
+    if bool(getattr(session, "pre_compression_snapshot", False)):
+        return False
+    for attr in ("archived", "is_archived", "deleted", "is_deleted"):
+        if bool(getattr(session, attr, False)):
+            return False
+    return True
+
+
+def _external_owner_bindings(session_id):
+    """``(session, bindings)`` for a trusted WebUI owner, else ``(None, None)``.
+
+    The profile comes from the loaded session record and the existing resolver
+    for it — never from event text and never from ``os.environ``.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return None, None
+    try:
+        from api.models import get_session
+    except Exception:
+        return None, None
+    try:
+        session = get_session(session_id)
+    except Exception:
+        session = None
+    if not _external_session_is_wakable(session):
+        return None, None
+    profile_home = _profile_home_for_name(getattr(session, "profile", None))
+    if profile_home is None:
+        return None, None
+    bindings = _external_bindings_for_session(session_id, profile_home)
+    if bindings is None:
+        return None, None
+    return session, bindings
+
+
+def _external_owner_wakeup_allowed(session) -> bool:
+    """False when existing pause metadata suppresses this wakeup lane.
+
+    The stored pause is matched against the session's persisted model/provider
+    lane (the real helper canonicalizes it). A pause recorded for
+    deepseek/deepseek-flash therefore suppresses this rail for that lane; a
+    changed model/provider lane, or a genuine credential-fingerprint change,
+    may pass so that ``routes.start_session_turn`` remains the authority that
+    clears the pause and revalidates credentials before any run starts. An
+    active pause whose lane cannot be resolved, or whose helper state is
+    unreadable, suppresses the wake (fail closed).
+    """
+
+    def _lane():
+        """Persisted lane from the session record only (no provider call).
+
+        A brand-new session that spawned a background task before its first
+        human turn has no persisted lane: then the stored pause's own lane is
+        used so the real matcher evaluates the pause against itself. An
+        unresolvable lane must conservatively keep an active pause in force,
+        never widen it into a wildcard match (None is not a wildcard in the
+        real helper).
+        """
+        model = getattr(session, "model", None)
+        provider = getattr(session, "model_provider", None)
+        if str(model or "").strip() or str(provider or "").strip():
+            return model, provider
+        return pause.get("model"), pause.get("provider")
+
+    def _credential_revalidation_allowed() -> bool:
+        """True only for a genuine credential-fingerprint change on this lane.
+
+        ``process_wakeup_pause_credential_state_changed`` also reports True
+        when the stored fingerprint is missing; a missing old fingerprint is
+        NOT evidence of a new credential, so this rail only lets a nonempty
+        stored fingerprint unlock a revalidation retry. Genuine changes stay
+        bounded: the mailbox wake lease limits the launch rate and the route
+        refreshes the stored fingerprint (or clears the pause) on its own
+        revalidation, so one recovered credential cannot relaunch a wake on
+        every tick.
+        """
+        previous = str(pause.get("credential_state_fingerprint") or "").strip()
+        classification = str(pause.get("classification") or "").strip()
+        if classification and not previous:
+            return False
+        try:
+            from api.models import process_wakeup_pause_credential_state_changed
+        except ImportError:
+            return False
+        try:
+            return bool(process_wakeup_pause_credential_state_changed(session))
+        except Exception:
+            return False
+
+    pause = getattr(session, "process_wakeup_pause", None)
+    if not isinstance(pause, dict) or not pause.get("paused"):
+        return True
+    try:
+        from api.models import process_wakeup_pause_matches
+    except ImportError:
+        return False
+    model, provider = _lane()
+    try:
+        if not process_wakeup_pause_matches(session, model=model, provider=provider):
+            # The stored pause belongs to a different lane; the route clears it
+            # via clear_process_wakeup_pause_if_model_changed and revalidates
+            # credentials before a run can start.
+            return True
+    except Exception:
+        return False
+    return _credential_revalidation_allowed()
+
+
+def _external_wakeup_prompt(evt) -> str:
+    prompt = format_wakeup_prompt(evt)
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    return "External completion is ready."
+
+
+def _wake_external_owner_once(
+    session, bindings, *, process_id: str = "",
+    prompt: str = "External completion is ready.",
+) -> bool:
+    """Start at most one leased server-side wakeup for a pending mailbox owner.
+
+    Busy and paused owners are left for a later tick of this same rail (the
+    mailbox keeps the event); a busy turn is never assumed to re-drain on its
+    own. The mailbox's finite lease suppresses duplicate wake launches.
+    """
+    session_id = str(bindings.get("owner_session_id") or "")
+    if not session_id or session is None:
+        return False
+    if _session_has_active_turn(session_id):
+        return False
+    if not _external_owner_wakeup_allowed(session):
+        return False
+    try:
+        from api.external_completion_mailbox import get_shared_mailbox
+        reserved = get_shared_mailbox().reserve_wakeup(bindings=bindings)
+    except Exception:
+        return False
+    if not reserved:
+        return False
+    _start_server_side_wakeup_turn(
+        session_id,
+        prompt,
+        process_id=str(process_id or ""),
+    )
+    return True
+
+
+def _handoff_external_completion_event(evt, bindings) -> bool:
+    """Validate -> mailbox inside the owner's profile context.
+
+    Never claims, ACKs, requeues, or starts a model here. A False return
+    leaves the durable native record untouched (bounded discovery and the
+    owner's own drain can still recover it).
+    """
+    if bindings is None:
+        return False
+    try:
+        from api.external_completion_mailbox import get_shared_mailbox
+        from tools import async_delegation as _native
+    except Exception:
+        return False
+    override = _bg_hermes_home_override(bindings.get("owner_profile", ""))
+    if override is None:
+        return False
+    override_mod, override_token = override
+    try:
+        accepted = get_shared_mailbox().offer(
+            evt,
+            bindings=bindings,
+            validate=lambda event, bindings=None: bool(
+                _native.validate_external_completion_event(
+                    event, bindings=bindings
+                )
+            ),
+        )
+    except Exception:
+        logger.debug("external completion mailbox offer failed", exc_info=True)
+        accepted = False
+    finally:
+        _reset_bg_hermes_home_override(override_mod, override_token)
+    return bool(accepted)
+
+
+def _process_external_completion_event(evt: dict) -> None:
+    """Hand one queued external completion event to its authenticated owner.
+
+    Interception runs before every legacy async claim/ACK/route-retry branch:
+    a queued external event must never enter the generic delegation path.
+    Ownership is resolved through the same server mapping / loaded-session
+    rail streaming uses; the queued payload supplies no authority. When the
+    owner cannot be positively resolved the durable native state is left
+    unclaimed (never requeued into this continuously drained queue) and
+    bounded discovery retries it later.
+    """
+    try:
+        from tools.process_registry import process_registry as registry
+    except Exception:
+        registry = None
+    process_id = completion_delivery_id(evt)
+    session_key = str(evt.get("session_key") or "")
+    origin_ui_session_id = str(evt.get("origin_ui_session_id") or "")
+    if process_id and (not session_key or not origin_ui_session_id):
+        try:
+            proc = registry.get(process_id) if registry is not None else None
+            if proc is not None:
+                if not session_key:
+                    session_key = str(getattr(proc, "session_key", "") or "")
+                if not origin_ui_session_id:
+                    origin_ui_session_id = (
+                        str(getattr(proc, "origin_ui_session_id", "") or "")
+                        or str(getattr(proc, "spawn_session_id", "") or "")
+                    )
+        except Exception:
+            logger.debug(
+                "external completion owner recovery failed for %r",
+                process_id,
+                exc_info=True,
+            )
+    session_id = ""
+    if session_key:
+        from api import config as _cfg
+        with _cfg.PROCESS_SESSION_INDEX_LOCK:
+            session_id = _cfg.PROCESS_SESSION_INDEX.get(session_key) or ""
+    if not session_id and not origin_ui_session_id:
+        logger.debug(
+            "external completion left durable: no owner mapping for %r",
+            evt.get("delegation_id"),
+        )
+        return
+    session_id = _resolve_completion_target(
+        session_key_resolved_sid=session_id,
+        origin_ui_session_id=origin_ui_session_id,
+    )
+    if not session_id:
+        logger.debug(
+            "external completion left durable: unresolved owner for %r",
+            evt.get("delegation_id"),
+        )
+        return
+    session, bindings = _external_owner_bindings(session_id)
+    if bindings is None:
+        logger.debug(
+            "external completion left durable: owner %r has no wakable session",
+            session_id,
+        )
+        return
+    if not _handoff_external_completion_event(evt, bindings):
+        logger.debug(
+            "external completion left durable: mailbox declined %r",
+            evt.get("delegation_id"),
+        )
+        return
+    _wake_external_owner_once(
+        session, bindings,
+        process_id=process_id,
+        prompt=_external_wakeup_prompt(evt),
+    )
+
+
+def _service_external_idle_rail() -> None:
+    """One bounded, throttled discovery/service pass on the existing tick.
+
+    Discovers at most one profile's durable owners per tick, rehydrates each
+    into a PRIVATE queue (never the shared completion queue, so this thread
+    cannot consume its own requeued event), offers validated events into the
+    shared mailbox, and starts at most one leased server-side wakeup per idle
+    owner. Also re-services owners whose mailbox events are already pending
+    (a busy or paused owner resumes here once it settles).
+    """
+    now = time.time()
+    with _EXTERNAL_DISCOVERY_LOCK:
+        if (now - _EXTERNAL_DISCOVERY_STATE["last_run"]) < _EXTERNAL_IDLE_TICK_SECONDS:
+            return
+        _EXTERNAL_DISCOVERY_STATE["last_run"] = now
+    profiles = _external_completion_profiles()
+    if not profiles:
+        return
+    with _EXTERNAL_DISCOVERY_LOCK:
+        index = _EXTERNAL_DISCOVERY_STATE["profile_index"] % len(profiles)
+        _EXTERNAL_DISCOVERY_STATE["profile_index"] = (index + 1) % len(profiles)
+    profile_home = _profile_home_for_name(profiles[index])
+    if profile_home is None:
+        return
+    override = _bg_hermes_home_override(profile_home)
+    if override is None:
+        # No context-local override means the profile DB cannot be selected;
+        # never fall back to the process-default database.
+        return
+    override_mod, override_token = override
+    wakeups = []
+    seen_owners = set()
+
+    def _durable_pending_wake(owner_session_id, bindings):
+        """Certify a still-durable pending, unclaimed event for one owner.
+
+        Returns ``(prompt, process_id)`` when the native durable row for these
+        exact bindings is still pending and unclaimed, else ``None``. The
+        mailbox accepted this owner's event earlier, but the durable row is
+        the authority: it can have been delivered, dropped, or claimed
+        elsewhere since. Inspect the bounded FIFO and validate it inside
+        the owner's profile context. Do not rehydrate: that reserves an enqueue
+        lease and can delay a busy-to-idle owner by five minutes. This check
+        neither consumes the mailbox event nor acquires any native lease.
+        """
+        if not isinstance(owner_session_id, str) or not owner_session_id:
+            return None
+        if not isinstance(bindings, dict):
+            return None
+        try:
+            from tools import async_delegation as _native
+        except Exception:
+            return None
+        try:
+            from api.external_completion_mailbox import get_shared_mailbox
+            events = get_shared_mailbox().pending_events(bindings=bindings)
+        except Exception:
+            return None
+        for evt in events:
+            if not _is_external_completion_event(evt):
+                continue
+            try:
+                if _native.validate_external_completion_event(evt, bindings=bindings):
+                    return _external_wakeup_prompt(evt), completion_delivery_id(evt)
+            except Exception:
+                continue
+        return None
+
+    try:
+        try:
+            from api.external_completion_mailbox import get_shared_mailbox
+            from tools import async_delegation as _native
+        except Exception:
+            return
+        with _EXTERNAL_DISCOVERY_LOCK:
+            after_owner = _EXTERNAL_DISCOVERY_STATE[
+                "owner_cursor_by_profile"
+            ].get(profile_home, "")
+        try:
+            owners = _native.list_external_completion_owners(
+                owner_profile=profile_home,
+                limit=_EXTERNAL_OWNERS_PER_PASS,
+                after_owner=after_owner,
+            )
+        except Exception:
+            logger.debug("external owner discovery failed", exc_info=True)
+            owners = []
+        with _EXTERNAL_DISCOVERY_LOCK:
+            cursors = _EXTERNAL_DISCOVERY_STATE["owner_cursor_by_profile"]
+            if owners:
+                cursors[profile_home] = owners[-1]
+            elif after_owner:
+                # A short page means the ordered scan wrapped: restart next tick.
+                cursors[profile_home] = ""
+        for owner_session_id in owners[:_EXTERNAL_OWNERS_PER_PASS]:
+            try:
+                private_queue = queue.Queue()
+                _native.rehydrate_external_completion_for_owner(
+                    private_queue,
+                    owner_session_id=owner_session_id,
+                    owner_profile=profile_home,
+                    limit=1,
+                )
+                evt = private_queue.get_nowait()
+            except queue.Empty:
+                continue
+            except Exception:
+                continue
+            session, bindings = _external_owner_bindings(owner_session_id)
+            if bindings is None or bindings.get("owner_profile") != profile_home:
+                continue
+            if not _handoff_external_completion_event(evt, bindings):
+                continue
+            if owner_session_id in seen_owners:
+                continue
+            seen_owners.add(owner_session_id)
+            wakeups.append((
+                session, bindings,
+                _external_wakeup_prompt(evt),
+                completion_delivery_id(evt),
+            ))
+        for bindings in get_shared_mailbox().pending_owners(
+            limit=_EXTERNAL_OWNERS_PER_PASS
+        ):
+            owner_session_id = str(bindings.get("owner_session_id") or "")
+            if not owner_session_id or owner_session_id in seen_owners:
+                continue
+            session, resolved = _external_owner_bindings(owner_session_id)
+            if resolved is None:
+                continue
+            seen_owners.add(owner_session_id)
+            # Busy and paused owners are left for a later tick of this same
+            # rail (the mailbox keeps the event). Skipping them here before the
+            # durable read avoids needless DB queries for gated owners.
+            # Certification must not acquire an enqueue lease.
+            # ``_wake_external_owner_once``
+            # still re-checks both gates authoritatively at wake time.
+            if _session_has_active_turn(owner_session_id):
+                continue
+            if not _external_owner_wakeup_allowed(session):
+                continue
+            # The mailbox copy is only a hint: certify against durable native
+            # state before starting a wake. A row that became delivered,
+            # dropped, or claimed elsewhere since the mailbox accepted it must
+            # never start another model turn; the existing idle tick bounds
+            # how often an unserviceable owner can be re-checked.
+            owner_profile = str(resolved.get("owner_profile") or "")
+            if owner_profile == profile_home:
+                durable = _durable_pending_wake(owner_session_id, resolved)
+            else:
+                nested = _bg_hermes_home_override(owner_profile)
+                if nested is None:
+                    continue
+                try:
+                    durable = _durable_pending_wake(owner_session_id, resolved)
+                finally:
+                    _reset_bg_hermes_home_override(nested[0], nested[1])
+            if durable is None:
+                continue
+            prompt, durable_process_id = durable
+            wakeups.append((session, resolved, prompt, durable_process_id))
+    finally:
+        _reset_bg_hermes_home_override(override_mod, override_token)
+    for session, bindings, prompt, process_id in wakeups:
+        try:
+            _wake_external_owner_once(
+                session, bindings, process_id=process_id,
+                **({"prompt": prompt} if prompt else {}),
+            )
+        except Exception:
+            logger.debug("external owner wake failed", exc_info=True)
+
+
 def _drain_loop() -> None:
     try:
         from tools import process_registry as _pr_mod  # noqa: F401
@@ -1940,6 +2541,12 @@ def _drain_loop() -> None:
         return
     logger.info("bg_task_complete drain thread started")
     while not _DRAIN_STOP.is_set():
+        # Service durable external-completion owners on this existing tick —
+        # not only when the queue is permanently empty (throttled inside).
+        try:
+            _service_external_idle_rail()
+        except Exception:
+            logger.debug("external completion idle rail failed", exc_info=True)
         # Read the queue defensively: a rebuilt/partially-initialized registry
         # may not expose ``completion_queue`` (mirrors streaming.py's
         # ``getattr(process_registry, 'completion_queue', None)`` guard). Direct
