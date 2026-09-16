@@ -2055,7 +2055,9 @@ async function forkFromMessage(msgIdx){
   // Capture the absolute keep_count before any async work that may
   // reset _oldestIdx.  _oldestIdx is 0 when the full transcript is
   // already loaded, so short/already-full sessions send msgIdx unchanged.
-  const absoluteKeepCount = _oldestIdx + msgIdx;
+  // Sparse retained runs carry per-range absolute starts; resolve this row's
+  // true absolute index instead of assuming one contiguous base (R1 / R128).
+  const absoluteKeepCount = (typeof _absoluteMessageIndex === 'function') ? _absoluteMessageIndex(msgIdx) : _oldestIdx + msgIdx;
   // Ensure the full transcript is loaded so the forked session renders
   // correctly and subsequent operations see the complete history.
   // Skip during streaming to avoid visual flicker — the fork data

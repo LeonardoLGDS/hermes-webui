@@ -9162,7 +9162,42 @@ _DISPLAY_WINDOW_SCAN_LIMIT = 4096
 _DISPLAY_WINDOW_ROW_LIMIT = 500
 
 
-def _message_window_for_display(messages, msg_limit=None, msg_before=None, expand_renderable=False) -> tuple[list, int]:
+def _reconcile_window_honesty(window, offset, meta, display_base_offset=0) -> dict:
+    """Recompute the bounded-window honesty fields from the FINAL returned page.
+
+    ``_message_window_for_display`` describes the window it produced, but the
+    route then applies the limited-payload hydrate, the response byte cap and
+    the raw-row cap, and the last two trim leading rows. A trimmed page can
+    therefore contain no renderable row even though the helper found one;
+    reporting the helper's pre-trim metadata would present a blank page as an
+    ordinary success and could complete paging past dropped readable rows.
+
+    Derive the fields from the rows actually returned: ``scan_exhausted`` and
+    ``incomplete`` are honest about the final page, and the cursor is either the
+    helper's absolute skip cursor (a junk page, translated only by the bounded
+    display base) or the final page offset (a readable helper page whose leading
+    rows were trimmed, so those rows stay reachable at the un-trimmed position).
+    """
+    readable_count = sum(
+        1 for row in window if _message_counts_as_renderable_for_window(row)
+    )
+    scan_exhausted = bool(window) and readable_count <= 0
+    if scan_exhausted and meta.get("scan_exhausted"):
+        source_cursor = int(meta.get("source_cursor") or 0) + int(display_base_offset)
+    else:
+        source_cursor = int(offset)
+    source_cursor = max(0, min(int(source_cursor), int(offset)))
+    return {
+        "scan_exhausted": scan_exhausted,
+        "incomplete": bool(scan_exhausted and source_cursor > 0),
+        "source_cursor": source_cursor,
+        "readable_count": readable_count,
+    }
+
+
+def _message_window_for_display(
+    messages, msg_limit=None, msg_before=None, expand_renderable=False, return_meta=False
+) -> tuple:
     """Return a paginated message window plus its offset in ``messages``.
 
     ``msg_limit`` is a visible transcript limit, not a raw storage-row cap.
@@ -9174,8 +9209,24 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
     ``expand_renderable`` is accepted for compatibility with older frontend
     callers. Visible-row expansion is now the default for every limited window.
     Reasoning-only rows do not consume that budget. The search examines at most
-    4096 trailing source rows, and the contiguous result contains at most 500
-    raw rows before the existing response-byte cap. Offsets remain source indices.
+    ``_DISPLAY_WINDOW_SCAN_LIMIT`` trailing source rows, and the contiguous
+    result contains at most ``_DISPLAY_WINDOW_ROW_LIMIT`` raw rows before the
+    existing response-byte cap. Offsets remain absolute source indices.
+
+    WHY (scan-exhaustion contract): a bounded scan that finds no renderable row
+    must never be presented as readable history. Callers that pass
+    ``return_meta=True`` receive a third element describing the window:
+    ``scan_exhausted`` (the bounded window contains no renderable row — either
+    the scan budget was consumed, or the found row lies deeper than the
+    row-limit lookback), ``incomplete`` (exhausted while unscanned source rows
+    remain, i.e. readable history may exist earlier — distinct from "no history
+    exists"), ``source_cursor`` (absolute ``msg_before`` cursor for the next
+    earlier page; decreases across pages and skips the rejected suffix when
+    exhausted), ``scan_start``, ``scan_limit`` (the available scan span inside
+    the trailing budget — an upper bound on, not the exact count of, rows the
+    backward scan evaluated), and ``readable_count`` (renderable rows actually
+    returned). The default 2-tuple shape is unchanged so existing readers keep
+    working.
     """
     _ = expand_renderable
     messages = list(messages or [])
@@ -9184,10 +9235,56 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
     else:
         before_idx = len(messages)
     source = messages[:before_idx]
+
+    def _finish(
+        window, offset, scan_start, scan_len, readable_count, next_cursor,
+        has_source=True,
+    ):
+        if not return_meta:
+            return window, offset
+        # WHY (honesty): ``scan_exhausted`` is True whenever the returned
+        # bounded window contains no renderable row -- either the scan budget
+        # was consumed (a pure miss) or the found row sits deeper than the
+        # row-limit lookback. Either way the page is not readable history and
+        # must never be presented as such. A session with no rows at all is
+        # not an exhausted window: there is nothing hidden to report.
+        readable_count = int(readable_count)
+        exhausted = bool(has_source) and readable_count <= 0
+        # WHY (monotonic cursor): the next earlier page must skip the rejected
+        # suffix instead of re-serving it. ``next_cursor`` is an absolute source
+        # coordinate <= ``offset``; reaching 0 means paging is complete.
+        source_cursor = max(0, min(int(next_cursor), int(offset)))
+        return window, offset, {
+            "scan_exhausted": exhausted,
+            "incomplete": bool(exhausted and source_cursor > 0),
+            "source_cursor": source_cursor,
+            "scan_start": int(scan_start),
+            "scan_limit": int(scan_len),
+            "readable_count": readable_count,
+        }
+
     if not source:
-        return [], 0
+        return _finish([], 0, 0, 0, 0, 0, has_source=False)
     if not msg_limit:
-        return source, 0
+        # Unbounded open (full transcript, no paging window): nothing to report.
+        # F7: the readable count is metadata-only, so legacy 2-tuple readers
+        # must not pay for a full predicate pass over the whole transcript.
+        return _finish(
+            source,
+            0,
+            0,
+            len(source),
+            (
+                sum(
+                    1
+                    for msg in source
+                    if _message_counts_as_renderable_for_window(msg)
+                )
+                if return_meta
+                else 0
+            ),
+            0,
+        )
     limit = max(1, int(msg_limit))
     end_idx = len(source)
     scan_start = max(0, end_idx - _DISPLAY_WINDOW_SCAN_LIMIT)
@@ -9196,9 +9293,23 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
         if _message_counts_as_renderable_for_window(source[idx]):
             last_renderable_idx = idx
             break
+    # Available scan span inside the budget. The backward scan stops at the
+    # first renderable row, so this is an upper bound on the rows actually
+    # evaluated, not the evaluated count (F7 accounting).
+    scanned_rows = end_idx - scan_start
     if last_renderable_idx is None:
+        # Bounded scan miss. The contiguous raw suffix is still returned so the
+        # legacy 2-tuple contract and absolute coordinates are preserved, but the
+        # metadata marks the window exhausted so no caller can mistake these
+        # rows — the ones the visibility predicate just rejected — for history.
         start_idx = max(0, end_idx - min(limit, _DISPLAY_WINDOW_ROW_LIMIT))
-        return source[start_idx:end_idx], start_idx
+        window = source[start_idx:end_idx]
+        # WHY: the scan just proved every row in [scan_start, end_idx) is
+        # non-renderable and this window is a slice of that range, so the count
+        # is zero by construction and no extra predicate work is charged.
+        return _finish(
+            window, start_idx, scan_start, scanned_rows, 0, scan_start
+        )
     # Keep the last renderable row, plus any immediately-following tool-result
     # rows whose tool_call_id matches a tool-call on a renderable row already in
     # the window. The renderer rebuilds tool cards (CLI-origin / empty
@@ -9231,7 +9342,58 @@ def _message_window_for_display(messages, msg_limit=None, msg_before=None, expan
         else:
             break
     window = source[start_idx:end_idx]
-    return window, start_idx
+    # F7: the lookback loop above already classified every row in
+    # [start_idx, last_renderable_idx]; rows after the last renderable row in
+    # the scanned range are non-renderable by construction, so re-counting the
+    # window with a second predicate pass is redundant work.
+    readable_count = renderable_count
+    if readable_count:
+        return _finish(
+            window, start_idx, scan_start, scanned_rows, readable_count, start_idx
+        )
+    # The scan found a renderable row deeper than the row-limit lookback, so the
+    # contiguous window (bounded by _DISPLAY_WINDOW_ROW_LIMIT) cannot include it.
+    # Report the page as carrying no readable history and hand back the cursor
+    # that skips the junk gap straight to the found row: every skipped row sits
+    # after the last renderable row, so none of them is readable history.
+    #
+    # F6: the found row may be an assistant tool call whose matching
+    # role:"tool" result sits immediately after it. Ending the cursor directly
+    # after the call would make the next page skip that result as
+    # predicate-rejected junk, so the recovered card would lose its snippet.
+    # Extend the skip cursor over the bounded, matching associated result span.
+    #
+    # G5 (F7): the skip cursor is metadata-only -- the default 2-tuple drops it
+    # entirely. Legacy callers must not pay for the associated-span predicate
+    # walk, so short-circuit before it whenever return_meta is False. The
+    # returned window and offset are unchanged, so the 2-tuple bytes are
+    # identical to the pre-r122 contract.
+    if not return_meta:
+        return window, start_idx
+    found_call_ids = _tool_call_ids_in_messages(
+        source[last_renderable_idx:last_renderable_idx + 1]
+    )
+    skip_cursor = last_renderable_idx + 1
+    # G4 (F6): the skip cursor must keep the call row inside the NEXT page's
+    # row-limit lookback. That lookback covers [skip_cursor - ROW_LIMIT,
+    # skip_cursor), so advancing the cursor ROW_LIMIT rows past the call would
+    # put the call exactly one row outside it and the next page would install a
+    # tool-only fragment. Bound the walk to ROW_LIMIT - 1 following rows so the
+    # call itself counts against the span.
+    while (
+        skip_cursor < end_idx
+        and skip_cursor - last_renderable_idx < _DISPLAY_WINDOW_ROW_LIMIT
+        and _tool_result_matches_call_ids(source[skip_cursor], found_call_ids)
+    ):
+        skip_cursor += 1
+    return _finish(
+        window,
+        start_idx,
+        scan_start,
+        scanned_rows,
+        0,
+        skip_cursor,
+    )
 
 
 _LIMITED_TOOL_CONTENT_MAX_CHARS = 4096
@@ -11475,6 +11637,10 @@ def _metadata_open_row_from_list_payload(
     item["_messages_truncated"] = False
     item["_messages_offset"] = 0
     item["_msg_limit_max"] = _MAX_MSG_LIMIT
+    item["_messages_scan_exhausted"] = False
+    item["_messages_incomplete"] = False
+    item["_messages_source_cursor"] = 0
+    item["_messages_window_readable_count"] = 0
     try:
         from api.models import _composer_draft_overlay_value
 
@@ -11558,6 +11724,10 @@ def _degraded_metadata_open_payload(
     row["_messages_truncated"] = False
     row["_messages_offset"] = 0
     row["_msg_limit_max"] = _MAX_MSG_LIMIT
+    row["_messages_scan_exhausted"] = False
+    row["_messages_incomplete"] = False
+    row["_messages_source_cursor"] = 0
+    row["_messages_window_readable_count"] = 0
     row["_metadata_response_degraded"] = True
     row["_metadata_degraded_reason"] = "memory_budget"
     return {
@@ -15127,12 +15297,24 @@ def _handle_get_impl(handler, parsed) -> bool:
             else:
                 _summary_message_count = None
                 _summary_last_message_at = None
+            # Honest bounded-window metadata (additive fields; see the
+            # scan-exhaustion contract on _message_window_for_display). Defaults
+            # keep the metadata-only/degraded shapes consistent.
+            _messages_scan_exhausted = False
+            _messages_incomplete = False
+            _messages_source_cursor = 0
+            _messages_window_readable_count = 0
             if load_messages:
-                _truncated_msgs, _messages_offset = _message_window_for_display(
+                (
+                    _truncated_msgs,
+                    _messages_offset,
+                    _window_meta,
+                ) = _message_window_for_display(
                     _all_msgs,
                     msg_limit=msg_limit,
                     msg_before=msg_before,
                     expand_renderable=expand_renderable,
+                    return_meta=True,
                 )
                 if msg_limit is not None:
                     _truncated_msgs = _messages_for_limited_payload(_truncated_msgs)
@@ -15151,6 +15333,27 @@ def _handle_get_impl(handler, parsed) -> bool:
                     excess_rows = len(_truncated_msgs) - _DISPLAY_WINDOW_ROW_LIMIT
                     _truncated_msgs = _truncated_msgs[excess_rows:]
                     _messages_offset += excess_rows
+                # WHY (F1/F2 honesty): the page offset and the source cursor are
+                # different quantities, and the byte/row trims above only remove
+                # leading rows. Reconcile the final page so a trim that dropped
+                # the readable rows cannot be reported as an ordinary blank
+                # success, and keep the trimmed rows recoverable: a junk page
+                # keeps the helper's absolute skip cursor, a readable page uses
+                # the final offset. Only the bounded-lane display base
+                # translates the cursor into the absolute source space.
+                _display_base_shift = (
+                    bounded_contract.display_base_offset if bounded_response else 0
+                )
+                _window_honesty = _reconcile_window_honesty(
+                    _truncated_msgs,
+                    _messages_offset,
+                    _window_meta,
+                    display_base_offset=_display_base_shift,
+                )
+                _messages_scan_exhausted = _window_honesty["scan_exhausted"]
+                _messages_incomplete = _window_honesty["incomplete"]
+                _messages_source_cursor = _window_honesty["source_cursor"]
+                _messages_window_readable_count = _window_honesty["readable_count"]
             else:
                 _truncated_msgs = []
                 _messages_offset = 0
@@ -15332,6 +15535,20 @@ def _handle_get_impl(handler, parsed) -> bool:
             raw["_messages_truncated"] = _truncated
             raw["_messages_offset"] = _messages_offset
             raw["_msg_limit_max"] = _MAX_MSG_LIMIT
+            # Additive bounded-window metadata (old clients ignore these):
+            # scan_exhausted says the bounded scan found no renderable row, so
+            # the returned page is not readable history; incomplete says
+            # unscanned source rows remain (history may exist earlier) as
+            # opposed to "no readable history exists"; source_cursor is the
+            # absolute msg_before cursor for the next earlier page, skipping the
+            # rejected suffix so paging strictly progresses toward row 0;
+            # window_readable_count is how many returned rows are renderable.
+            raw["_messages_scan_exhausted"] = bool(_messages_scan_exhausted)
+            raw["_messages_incomplete"] = bool(_messages_incomplete)
+            raw["_messages_source_cursor"] = int(_messages_source_cursor)
+            raw["_messages_window_readable_count"] = int(
+                _messages_window_readable_count
+            )
             _t4 = _time.monotonic()
             if _diag: _diag.stage("t4_after_compact_and_merge")
             if effective_model:
@@ -15456,14 +15673,35 @@ def _handle_get_impl(handler, parsed) -> bool:
             # row on every load and omitted _messages_truncated entirely, so the
             # frontend's hasServerOlder check was always false: no "Load earlier
             # messages" button, whole transcript resident.
-            _foreign_window, _foreign_offset = _message_window_for_display(
-                msgs,
-                msg_limit=msg_limit,
-                msg_before=msg_before,
-                expand_renderable=True,
-            ) if load_messages else ([], 0)
+            if load_messages:
+                (
+                    _foreign_window,
+                    _foreign_offset,
+                    _foreign_meta,
+                ) = _message_window_for_display(
+                    msgs,
+                    msg_limit=msg_limit,
+                    msg_before=msg_before,
+                    expand_renderable=True,
+                    return_meta=True,
+                )
+            else:
+                _foreign_window, _foreign_offset = [], 0
+                _foreign_meta = {
+                    "scan_exhausted": False,
+                    "source_cursor": 0,
+                    "readable_count": 0,
+                }
             from api.wsbound import bounded_window
             _foreign_window, _foreign_offset = bounded_window(_foreign_window, _foreign_offset)
+            # F2: reconcile the honesty metadata against the page actually
+            # returned. bounded_window can drop leading rows (including
+            # readable ones), so the pre-trim helper metadata must not be
+            # shipped as an ordinary blank success and the dropped rows must
+            # stay reachable by following the cursor.
+            _foreign_honesty = _reconcile_window_honesty(
+                _foreign_window, _foreign_offset, _foreign_meta
+            )
             sess = {
                 "session_id": synth.session_id,
                 "title": synth.title,
@@ -15509,6 +15747,12 @@ def _handle_get_impl(handler, parsed) -> bool:
                     load_messages and msg_limit is not None and _foreign_offset > 0
                 ),
                 "_messages_offset": _foreign_offset,
+                "_messages_scan_exhausted": bool(_foreign_honesty["scan_exhausted"]),
+                "_messages_incomplete": bool(_foreign_honesty["incomplete"]),
+                "_messages_source_cursor": int(_foreign_honesty["source_cursor"]),
+                "_messages_window_readable_count": int(
+                    _foreign_honesty["readable_count"]
+                ),
             }
             # todo_state is derived from the FULL history, matching the native path.
             attach_todo_state(sess, msgs)

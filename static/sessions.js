@@ -1410,6 +1410,7 @@ async function newSession(flash, options={}){
     S.toolCalls=[];
     _messagesTruncated=false;
     _oldestIdx=0;
+    if(typeof _resetMessagesWindowMeta==='function') _resetMessagesWindowMeta();
     clearLiveToolCards();
     // Explicit profile switch wins, then the current conversation, then the profile default.
     // Provenance lets the server recover only a deleted inherited path; explicit paths stay strict.
@@ -1836,6 +1837,7 @@ async function loadSession(sid){
       S.toolCalls = [];
       _messagesTruncated = false;
       _oldestIdx = 0;
+      if (typeof _resetMessagesWindowMeta === 'function') _resetMessagesWindowMeta();
     }
     // Close live SSE streams from the session we're leaving. The error
     // handler checks _isSessionActivelyViewed() and won't auto-reconnect
@@ -3028,6 +3030,42 @@ function _resolveSessionModelForDisplaySoon(sid){
 // When true, scrolling to the top triggers _loadOlderMessages().
 let _messagesTruncated = false;
 
+// Bounded-window honesty metadata mirrored from the server's additive
+// `_messages_*` fields (see _message_window_for_display's scan-exhaustion
+// contract in api/routes.py). _messagesScanExhausted means the last bounded
+// page was a scan miss (rows the visibility predicate rejects) and must never
+// be presented as readable history; _messagesIncomplete means unscanned source
+// rows remain, so readable history may exist earlier; _messagesSourceCursor is
+// the absolute `msg_before` cursor that skips the rejected suffix and strictly
+// decreases toward source row 0.
+let _messagesScanExhausted = false;
+let _messagesIncomplete = false;
+let _messagesSourceCursor = 0;
+let _messagesWindowReadableCount = 0;
+let _messagesScanAttempts = 0;
+// Fixed attempt budget for one bounded find-earlier invocation. WHY: each
+// attempt costs at most one bounded server scan (<= _DISPLAY_WINDOW_SCAN_LIMIT
+// source rows); a fixed budget plus the strictly decreasing source cursor is
+// what guarantees termination without ever opening the whole session.
+const _FIND_EARLIER_MAX_ATTEMPTS = 8;
+// Fixed page budget for one bounded full-history load. Each step is one
+// bounded backward window (<= _MSG_LIMIT_MAX rows), so the load terminates
+// even for a very long transcript and never opens the session unboundedly.
+const _ENSURE_ALL_MAX_PAGES = 64;
+
+function _applyMessagesWindowMeta(session){
+  const src=session||{};
+  _messagesScanExhausted=!!src._messages_scan_exhausted;
+  _messagesIncomplete=!!src._messages_incomplete;
+  _messagesSourceCursor=Math.max(0,Number(src._messages_source_cursor)||0);
+  _messagesWindowReadableCount=Math.max(0,Number(src._messages_window_readable_count)||0);
+  if(!_messagesScanExhausted) _messagesScanAttempts=0;
+}
+
+function _resetMessagesWindowMeta(){
+  _applyMessagesWindowMeta(null);
+}
+
 // Load session messages if not already present.
 // Called after loadSession fetches metadata (messages=0).
 // Idempotent: if messages are already in S.messages, resolves immediately.
@@ -3187,6 +3225,7 @@ async function _ensureMessagesLoaded(sid, opts) {
   if (!data || !data.session) return;
   _messagesTruncated = !!data.session._messages_truncated;
   _oldestIdx = data.session._messages_offset || 0;
+  if (typeof _applyMessagesWindowMeta === 'function') _applyMessagesWindowMeta(data.session);
   _msgLimitMax = data.session._msg_limit_max || _MSG_LIMIT_MAX;
   // #3162: `msgs` is reassigned below by the #3018 ephemeral-field carry-forward,
   // so it must be `let`, not `const`. The `const` form threw a TypeError inside
@@ -3272,6 +3311,20 @@ async function _ensureMessagesLoaded(sid, opts) {
       _setSessionViewedCount(sid, Number(S.session.message_count || msgs.length));
     }
     if(typeof syncTopbar==='function') syncTopbar();
+  }
+  // Bounded-open honesty: a scan-exhausted initial page is not readable
+  // history. Run the bounded find-earlier scan right away (fixed attempt
+  // budget) so the user never lands on a blank transcript with no
+  // explanation. Skipped while a stream owns the session so live rows are
+  // never dropped; the click/scroll affordances still cover that case.
+  if(
+    typeof _messagesScanExhausted!=='undefined' && _messagesScanExhausted
+    && typeof _messagesIncomplete!=='undefined' && _messagesIncomplete
+    && typeof _findEarlierReadableHistory==='function'
+    && !(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid])
+    && !(typeof S!=='undefined'&&S&&S.busy)
+  ){
+    _findEarlierReadableHistory();
   }
 }
 
@@ -3682,6 +3735,7 @@ let _loadingOlder = false;
 // oldest message currently loaded in S.messages. Starts at 0 when all
 // messages are loaded, or > 0 when truncated by msg_limit.
 let _oldestIdx = 0;
+
 // Generation token bumped every time S.messages is wholesale-replaced
 // (rather than incrementally extended). _loadOlderMessages snapshots it
 // before its `await` and re-checks after, so a late-resolving prefetch
@@ -3696,11 +3750,249 @@ function _bumpMessagesGeneration() {
   return _messagesGeneration;
 }
 
+// Bounded progressive scan for readable history hidden behind a junk tail.
+// WHY: a bounded open can legitimately return only non-renderable rows (the
+// server marks that page `_messages_scan_exhausted`). Painting or prepending
+// those rows would show a blank transcript, so instead we ask for the page
+// ending at the server's absolute `_messages_source_cursor` — which skips the
+// suffix the visibility predicate rejected — for a fixed number of attempts.
+// Every attempt strictly decreases the cursor, so the scan always stops with an
+// explicit result (found / incomplete / attempt budget reached) and never opens
+// the whole session. An accepted page WHOLESALE-REPLACES S.messages, keeping
+// the loaded array a contiguous source range so `_oldestIdx + local index`
+// still identifies the original record for edit/regenerate/fork resolution.
+let _findingEarlierReadable = false;
+async function _findEarlierReadableHistory(){
+  if(_findingEarlierReadable) return false;
+  // Run when the last bounded page was a scan miss, or when a previous
+  // recovery left the scan explicitly incomplete with an older source cursor
+  // still to walk (a readable page is not proof that no readable row remains
+  // beneath it). Completion clears `_messagesIncomplete`, so this cannot loop
+  // on a finished transcript.
+  if(!_messagesScanExhausted&&!(_messagesIncomplete&&Math.max(0,Number(_messagesSourceCursor)||0)>0)) return false;
+  const sid=S.session?S.session.session_id:null;
+  if(!sid) return false;
+  if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid]) return false;
+  if(typeof S!=='undefined'&&S&&S.busy) return false;
+  _findingEarlierReadable=true;
+  _messagesScanAttempts=0;
+  // F3: the scan cursor is a server progress coordinate, NOT the base of the
+  // retained array (`_oldestIdx`). Every junk page must be able to advance the
+  // scan cursor without touching `_oldestIdx` or S.messages, or the next
+  // edit/regenerate/fork capture (`_oldestIdx + local index`) resolves against
+  // a base that no longer matches the retained contiguous range.
+  let requestedCursor=null;
+  // F4: snapshot the ownership generation so a wholesale replace (navigation,
+  // rebuild) or a live stream starting during the await cancels the scan; a
+  // generation bump on success is not a cancellation check by itself.
+  const startGeneration=_messagesGeneration;
+  // Leave-and-return to the same session id still replaces the S.session
+  // object, so identity (not just the id) is part of the ownership snapshot.
+  const startSessionRef=(typeof S!=='undefined')?S.session:null;
+  // G2: a completed intervening turn leaves no live busy/INFLIGHT trace, but it
+  // DOES replace S.messages. Snapshot the retained transcript array itself as
+  // the durable ownership stamp: every install path (stream merge, load,
+  // refresh, rebuild) assigns a new array, so a changed reference proves the
+  // transcript moved while this request was in flight. `_messagesGeneration`
+  // plus the session object identity remain as the counter/object guards.
+  const startMessagesRef=(typeof S!=='undefined')?S.messages:null;
+  try{
+    while(_messagesScanAttempts<_FIND_EARLIER_MAX_ATTEMPTS){
+      const cursor=Math.max(0,Number(_messagesSourceCursor)||0);
+      // Completion: the server reached source row 0 with no readable row left.
+      if(!(cursor>0)){ _messagesIncomplete=false; break; }
+      // Progress is measured against the PREVIOUS requested cursor, not against
+      // `_oldestIdx`. Cursor == page offset is a legal first request at the
+      // lookback boundary, and a junk page must never look like a stall.
+      if(requestedCursor!==null&&!(cursor<requestedCursor)) break;
+      requestedCursor=cursor;
+      _messagesScanAttempts+=1;
+      const data=await api(
+        `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${cursor}&msg_limit=${_INITIAL_MSG_LIMIT}`,
+        {timeoutMs:120000}
+      );
+      if(!data||!data.session) break;
+      if(!S.session||S.session.session_id!==sid) break;
+      if(_loadingSessionId!==null&&_loadingSessionId!==sid) break;
+      // Ownership cancellation after await: a rebuilt transcript, a new
+      // session object (leave-and-return), a restarted generation, or a live
+      // stream that started while we were in flight must all win over this
+      // late page. Never wholesale-replace under any of them.
+      if(_messagesGeneration!==startGeneration) break;
+      if(startSessionRef&&S.session!==startSessionRef) break;
+      if(startMessagesRef&&S&&S.messages!==startMessagesRef) break;
+      if(typeof INFLIGHT!=='undefined'&&INFLIGHT&&INFLIGHT[sid]) break;
+      if(typeof S!=='undefined'&&S&&S.busy) break;
+      const page=(data.session.messages||[]).filter(m=>m&&m.role);
+      if(!data.session._messages_scan_exhausted){
+        // The server found readable history inside this bounded page, which may
+        // be adjacent to the retained range or separated from it by a junk gap.
+        // Either way both sides are kept; see the merge below.
+        const recoveredOffset=Math.max(0,Number(data.session._messages_offset)||0);
+        const retained=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages:[];
+        const retainedBase=Math.max(0,Number(_oldestIdx)||0);
+        // R1: recover the readable page into the retained transcript instead of
+        // discarding it. The retained runs and the recovered page are merged by
+        // absolute source index, so a page that overlaps, abuts, or is separated
+        // from the retained range by a junk gap keeps truthful coordinates for
+        // both sides. Discarding a disjoint page used to leave the scan cursor
+        // parked in front of the same known-readable page, so every click
+        // re-fetched and threw away the same rows.
+        const merged=_mergeMessageRuns(
+          _retainedMessageRuns(retained,retainedBase).concat([{start:recoveredOffset,rows:page}])
+        );
+        if(!merged.rows.length){ _messagesIncomplete=true; break; }
+        _bumpMessagesGeneration();
+        let next=merged.rows;
+        if(typeof window._carryForwardEphemeralTurnFields==='function'){
+          next=window._carryForwardEphemeralTurnFields(retained,next);
+        }
+        S.messages=next;
+        _setMessageSegments(merged.segments);
+        _syncToolCallsForLoadedMessages(next,data.session.tool_calls);
+        _applyMessagesWindowMeta(data.session);
+        _oldestIdx=merged.segments[0].start;
+        // Completion is only ever the contiguous range that starts at source
+        // row 0 and is not truncated by the server. A sparse union, or a window
+        // that still has older source rows beneath it, stays explicitly
+        // unloaded (never reported as a complete fragment).
+        const complete=merged.segments.length===1&&merged.segments[0].start===0&&!data.session._messages_truncated;
+        _messagesTruncated=!complete;
+        // Honesty: an older source cursor remains to scan, so readable history
+        // may still exist beneath the recovered range. When the cursor is 0 the
+        // server's own incomplete flag is authoritative.
+        if(!complete&&Math.max(0,Number(data.session._messages_source_cursor)||0)>0) _messagesIncomplete=true;
+        if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
+        return true;
+      }
+      // Still a junk page: adopt the server's next skip cursor and keep
+      // scanning. Never prepend the rejected rows and never move the retained
+      // array base -- `_oldestIdx` still describes S.messages.
+      _applyMessagesWindowMeta(data.session);
+      if(!_messagesIncomplete) break;
+    }
+    if(typeof renderMessages==='function') renderMessages({preserveScroll:true});
+    return false;
+  }catch(_err){
+    // Bounded scan failures leave the explicit incomplete state intact; the
+    // affordance stays available and the cursor was never advanced past a
+    // readable row.
+    return false;
+  } finally {
+    _findingEarlierReadable=false;
+  }
+}
+
+// Absolute source segments of the rows currently in S.messages. The historical
+// contract is a single contiguous range: while `_messageSegments` is null,
+// `_oldestIdx + local index` is the row's absolute source index and every
+// caller may rely on that. A bounded recovery can also find a readable range
+// separated from the retained range by a run of non-readable rows; S.messages
+// then holds several disjoint runs in ascending source order, and this records
+// each run's absolute start/length so coordinates stay truthful instead of
+// being silently rebased onto one of the runs (R1 / R128).
+let _messageSegments = null;
+
+function _messageSegmentsValid(segments, rowCount){
+  if(!Array.isArray(segments)||!segments.length) return false;
+  let total=0;
+  let previousEnd=-1;
+  for(const segment of segments){
+    const start=Math.max(0,Number(segment&&segment.start)||0);
+    const length=Math.max(0,Number(segment&&segment.length)||0);
+    if(length<=0) return false;
+    if(previousEnd>=0&&start<=previousEnd) return false;
+    previousEnd=start+length;
+    total+=length;
+  }
+  return total===rowCount;
+}
+
+function _setMessageSegments(segments){
+  const rowCount=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages.length:0;
+  // One run is the historical contiguous case: keep `_messageSegments` null so
+  // every existing `_oldestIdx + local index` caller stays exact.
+  _messageSegments=(Array.isArray(segments)&&segments.length>1&&_messageSegmentsValid(segments,rowCount))
+    ? segments.map(segment=>({start:segment.start,length:segment.length}))
+    : null;
+}
+
+function _messagesAreSparse(){ return !!_messageSegments; }
+
+// Absolute source index for the row at `localIdx` in S.messages. Falls back to
+// the historical `_oldestIdx + localIdx` contract whenever the array is
+// contiguous (or the recorded segments no longer describe the current array).
+function _absoluteMessageIndex(localIdx){
+  const index=Number(localIdx);
+  const base=Math.max(0,Number(_oldestIdx)||0);
+  const rowCount=(typeof S!=='undefined'&&S&&Array.isArray(S.messages))?S.messages.length:0;
+  if(Number.isFinite(index)&&index>=0&&_messageSegmentsValid(_messageSegments,rowCount)){
+    let offset=0;
+    for(const segment of _messageSegments){
+      if(index<offset+segment.length) return Math.max(0,Number(segment.start)||0)+(index-offset);
+      offset+=segment.length;
+    }
+  }
+  return base+(Number.isFinite(index)?index:0);
+}
+
+// The retained array described as absolute runs. Contiguous arrays yield one
+// run anchored at `_oldestIdx`; sparse arrays split on the recorded boundaries.
+function _retainedMessageRuns(retained,base){
+  const rows=Array.isArray(retained)?retained:[];
+  if(!rows.length) return [];
+  if(_messageSegmentsValid(_messageSegments,rows.length)){
+    const runs=[];
+    let offset=0;
+    for(const segment of _messageSegments){
+      runs.push({start:segment.start,rows:rows.slice(offset,offset+segment.length)});
+      offset+=segment.length;
+    }
+    return runs;
+  }
+  return [{start:Math.max(0,Number(base)||0),rows}];
+}
+
+// Combine absolute runs, de-duplicating by absolute source index and merging
+// runs that end up adjacent. Returns rows ordered oldest-first plus the run
+// descriptor for the result.
+function _mergeMessageRuns(runs){
+  const byIndex=new Map();
+  for(const run of (runs||[])){
+    if(!run||!Array.isArray(run.rows)) continue;
+    const start=Math.max(0,Number(run.start)||0);
+    run.rows.forEach((message,offset)=>{
+      if(!message||!message.role) return;
+      byIndex.set(start+offset,message);
+    });
+  }
+  const indexes=[...byIndex.keys()].sort((a,b)=>a-b);
+  const segments=[];
+  for(const index of indexes){
+    const tail=segments[segments.length-1];
+    if(tail&&index===tail.start+tail.length) tail.length+=1;
+    else segments.push({start:index,length:1});
+  }
+  return {rows:indexes.map(index=>byIndex.get(index)),segments};
+}
+
 async function _loadOlderMessages() {
   if (_loadingOlder || !_messagesTruncated) return;
   const sid = S.session ? S.session.session_id : null;
   if (!sid || !S.messages.length) return;
-  if (_oldestIdx <= 0) { _messagesTruncated = false; return; }
+  if (_oldestIdx <= 0) {
+    // A sparse retained array already holds the oldest source row, but its runs
+    // are separated by source rows the UI never loaded. Only clear truncation
+    // once the bounded scan has confirmed nothing readable remains earlier.
+    if (!_messagesIncomplete) _messagesTruncated = false;
+    return;
+  }
+  if (typeof _messagesScanExhausted !== 'undefined' && _messagesScanExhausted) {
+    // The page behind the cursor is a bounded scan miss. Hand off to the
+    // bounded find-earlier scan instead of prepending rejected rows.
+    if (typeof _findEarlierReadableHistory === 'function') _findEarlierReadableHistory();
+    return;
+  }
   _loadingOlder = true;
   // Snapshot the generation BEFORE we await. If S.messages is wholesale
   // replaced while the request is in flight, the post-await check below
@@ -3726,7 +4018,11 @@ async function _loadOlderMessages() {
     //    arbitrarily long transcripts. (This is the same paging request the
     //    race-fallback below uses, proven correct there.)
     const requestedLimit = Math.max(_INITIAL_MSG_LIMIT, (S.messages || []).length + _INITIAL_MSG_LIMIT);
-    const useBeforePaging = requestedLimit >= _msgLimitMax;
+    // Sparse retained runs must never take the growing-tail-window path: that
+    // path wholesale-replaces the array with a newer window and would drop the
+    // recovered older readable range. Page backward instead.
+    const sparseRetained = (typeof _messagesAreSparse === 'function') && _messagesAreSparse();
+    const useBeforePaging = requestedLimit >= _msgLimitMax || sparseRetained;
     const data = useBeforePaging
       ? await api(
           `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${_oldestIdx}&msg_limit=${_INITIAL_MSG_LIMIT}`,
@@ -3802,7 +4098,26 @@ async function _loadOlderMessages() {
       olderMsgs = (responseSession.messages || []).filter(m => m && m.role);
       nextMessages = [...olderMsgs, ...S.messages];
     }
-    if (!olderMsgs.length) { _messagesTruncated = !!responseSession._messages_truncated; return; }
+    // F3: a freshly returned ordinary older page can itself be a bounded scan
+    // miss (all rows rejected by the visibility predicate). Applying the
+    // exhaustion metadata only after assembling the page used to prepend those
+    // rejected rows and shift every retained absolute index. Never prepend a
+    // rejected page and never rebase `_oldestIdx` onto it: keep the retained
+    // array/base intact, mirror the server scan state, and let the entry gate
+    // route the next attempt through the bounded find-earlier scan.
+    if (
+      responseSession._messages_scan_exhausted &&
+      !Number(responseSession._messages_window_readable_count || 0)
+    ) {
+      if (typeof _applyMessagesWindowMeta === 'function') _applyMessagesWindowMeta(responseSession);
+      _messagesTruncated = !!responseSession._messages_truncated;
+      return;
+    }
+    if (!olderMsgs.length) {
+      if (typeof _applyMessagesWindowMeta === 'function') _applyMessagesWindowMeta(responseSession);
+      _messagesTruncated = !!responseSession._messages_truncated;
+      return;
+    }
     // Replace with the larger tail window and preserve scroll as if older
     // messages were prepended. When the suffix check fails, nextMessages
     // already encodes the legacy prepend fallback so the visible behavior
@@ -3820,7 +4135,22 @@ async function _loadOlderMessages() {
     if (typeof window._carryForwardEphemeralTurnFields === 'function') {
       nextMessages = window._carryForwardEphemeralTurnFields(S.messages || [], nextMessages);
     }
+    let nextSegments = null;
+    if (!tailMatches && typeof _mergeMessageRuns === 'function' && typeof _retainedMessageRuns === 'function') {
+      // An older msg_before page (primary or race fallback). Keep it together
+      // with the retained runs under truthful absolute coordinates; when the
+      // page abuts the retained base the union collapses to one contiguous run
+      // and `_messageSegments` stays null (the historical contract).
+      const merged = _mergeMessageRuns(
+        _retainedMessageRuns(S.messages || [], _oldestIdx).concat([
+          {start: Math.max(0, Number(responseSession._messages_offset) || 0), rows: olderMsgs},
+        ])
+      );
+      if (merged.rows.length) nextMessages = merged.rows;
+      nextSegments = merged.segments;
+    }
     S.messages = nextMessages;
+    _setMessageSegments(nextSegments);
     _syncToolCallsForLoadedMessages(nextMessages, responseSession.tool_calls);
     // renderMessages() windows long transcripts from the end. If we do not
     // expand that window before rendering, the newly prepended page stays
@@ -3839,8 +4169,11 @@ async function _loadOlderMessages() {
       return !!(msgContent(m)||m._statusCard||m.attachments?.length||(m.role==='assistant'&&(hasTc||hasTu||hasPartialTc||(typeof _messageHasReasoningPayload==='function'&&_messageHasReasoningPayload(m))||(typeof _assistantMessageHasVisibleContent==='function'&&_assistantMessageHasVisibleContent(m)))));
     }).length;
     _messageRenderWindowSize=_currentMessageRenderWindowSize()+Math.max(addedRenderable, MESSAGE_RENDER_WINDOW_DEFAULT);
+    if (typeof _applyMessagesWindowMeta === 'function') _applyMessagesWindowMeta(responseSession);
     _messagesTruncated = !!responseSession._messages_truncated;
-    _oldestIdx = responseSession._messages_offset || 0;
+    _oldestIdx = (Array.isArray(nextSegments) && nextSegments.length)
+      ? nextSegments[0].start
+      : (responseSession._messages_offset || 0);
     renderMessages({ preserveScroll: true });
     if (container) {
       // Prepending older messages must not teleport the reader. Anchor to the
@@ -3906,38 +4239,109 @@ async function _ensureAllMessagesLoaded() {
   _loadingOlder = true;
   try {
     const sid = S.session.session_id;
-    const data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`, {timeoutMs:120000});
-    // Guard: api() may have redirected (401) and returned undefined.
-    if (!data || !data.session) return;
-    // Session may have been switched while we awaited. Bail rather than
-    // overwrite the new session's messages.
-    if (!S.session || S.session.session_id !== sid) return;
-    if (_loadingSessionId !== null && _loadingSessionId !== sid) return;
-    const msgs = (data.session.messages || []).filter(m => m && m.role);
-    // Bump the generation BEFORE the wholesale replace so any racing
-    // prefetch (whose snapshot was taken before this call's mutex
-    // acquisition) sees the new value and aborts.
-    _bumpMessagesGeneration();
-    // #3306: Same ephemeral-field carry-forward as _ensureMessagesLoaded.
-    // Loading older messages also does a wholesale replace of S.messages
-    // and would otherwise drop _turnUsage/_turnDuration/_turnTps/
-    // _gatewayRouting/_statusCard/_anchor_stream_id on the existing turns.
-    let _msgsToAssign = msgs;
-    if (typeof window._carryForwardEphemeralTurnFields === 'function') {
-      _msgsToAssign = window._carryForwardEphemeralTurnFields(S.messages || [], msgs);
-    }
-    S.messages = _msgsToAssign;
-    _messagesTruncated = false;
-    _oldestIdx = 0;
-    _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);
-    if (S.session && S.session.session_id === sid) {
-      S.session.message_count = Number(data.session.message_count || msgs.length);
-      if (Object.prototype.hasOwnProperty.call(data.session, 'regeneration_revision')) {
-        S.session.regeneration_revision = data.session.regeneration_revision;
-      } else {
-        delete S.session.regeneration_revision;
+    const startGeneration = _messagesGeneration;
+    const startSessionRef = S.session;
+    const startMessagesRef = S.messages;
+    const retained = Array.isArray(S.messages) ? S.messages : [];
+    const maxPages = (typeof _ENSURE_ALL_MAX_PAGES === 'number') ? _ENSURE_ALL_MAX_PAGES : 64;
+    // Install a transcript that is known to be the contiguous range from source
+    // row 0. #3306: preserve ephemeral turn fields across the wholesale replace.
+    const installFullTranscript = (messages, serverSession) => {
+      _bumpMessagesGeneration();
+      let carried = messages;
+      if (typeof window._carryForwardEphemeralTurnFields === 'function') {
+        carried = window._carryForwardEphemeralTurnFields(S.messages || [], messages);
       }
+      S.messages = carried;
+      if (typeof _setMessageSegments === 'function') _setMessageSegments(null);
+      _messagesTruncated = false;
+      _oldestIdx = 0;
+      _syncToolCallsForLoadedMessages(carried, serverSession && serverSession.tool_calls);
+      if (typeof _resetMessagesWindowMeta === 'function') _resetMessagesWindowMeta();
+      if (S.session && S.session.session_id === sid) {
+        S.session.message_count = Number((serverSession && serverSession.message_count) || carried.length);
+        if (serverSession && Object.prototype.hasOwnProperty.call(serverSession, 'regeneration_revision')) {
+          S.session.regeneration_revision = serverSession.regeneration_revision;
+        } else {
+          delete S.session.regeneration_revision;
+        }
+      }
+    };
+    const ownershipHolds = () => !!(
+      S.session && S.session.session_id === sid &&
+      (_loadingSessionId === null || _loadingSessionId === sid) &&
+      _messagesGeneration === startGeneration &&
+      S.session === startSessionRef &&
+      S.messages === startMessagesRef
+    );
+    // R2: the bare /api/session request is bounded by the server's default
+    // msg_limit, so its response is the full transcript only when the server
+    // reports source row 0 with no truncation. Installing a bounded tail as if
+    // it were full history cleared truncation, rebased to 0 and dropped the
+    // retained rows. Completion now requires the contiguous prefix from source
+    // row 0 to have actually been obtained through bounded older-page requests.
+    const bare = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0`, {timeoutMs:120000});
+    if (!bare || !bare.session) return;
+    if (!ownershipHolds()) return;
+    let attempts = 1;
+    if (bare.session._messages_offset === 0 && !bare.session._messages_truncated && !bare.session._messages_scan_exhausted) {
+      installFullTranscript((bare.session.messages || []).filter(m => m && m.role), bare.session);
+      return;
     }
+    // The bounded older-page walk below relies on the retained-run merge
+    // helpers. When this function is evaluated without them (isolated legacy
+    // harnesses that extract only this function), it must still refuse to
+    // install a bounded response as full history.
+    const mergeRuns = (typeof _mergeMessageRuns === 'function') ? _mergeMessageRuns : null;
+    const retainedRuns = (typeof _retainedMessageRuns === 'function') ? _retainedMessageRuns : null;
+    const setSegments = (typeof _setMessageSegments === 'function') ? _setMessageSegments : null;
+    if (!mergeRuns || !retainedRuns || !setSegments) {
+      _messagesTruncated = true;
+      _messagesIncomplete = true;
+      return;
+    }
+    let runs = retainedRuns(retained, _oldestIdx);
+    let newestTruncated = !!bare.session._messages_truncated;
+    while (attempts < maxPages) {
+      const coverageStart = runs.length ? Math.min(...runs.map(run => run.start)) : 0;
+      if (coverageStart <= 0) break;
+      const older = await api(
+        `/api/session?session_id=${encodeURIComponent(sid)}&messages=1&resolve_model=0&msg_before=${coverageStart}&msg_limit=${_MSG_LIMIT_MAX}`,
+        {timeoutMs:120000}
+      );
+      // A failed/redirected page request stops the walk with the honest
+      // coverage already obtained; an ownership change must install nothing.
+      if (!older || !older.session) break;
+      if (!ownershipHolds()) return;
+      attempts += 1;
+      const page = (older.session.messages || []).filter(m => m && m.role);
+      const offset = Math.max(0, Number(older.session._messages_offset) || 0);
+      if (!page.length || offset >= coverageStart) break;
+      runs.push({start: offset, rows: page});
+      if (offset === 0) { newestTruncated = !!older.session._messages_truncated; break; }
+    }
+    const merged = mergeRuns(runs);
+    if (merged.segments.length === 1 && merged.segments[0].start === 0 && !newestTruncated && merged.rows.length) {
+      installFullTranscript(merged.rows, bare.session);
+      return;
+    }
+    // Not complete: never clear truncation and never rebase a nonzero-offset
+    // window to 0. Install the honest older coverage the bounded walk did
+    // obtain (if any) so the next attempt starts closer to source row 0, and
+    // leave the transcript explicitly incomplete.
+    if (merged.rows.length > retained.length) {
+      _bumpMessagesGeneration();
+      let _msgsToAssign = merged.rows;
+      if (typeof window._carryForwardEphemeralTurnFields === 'function') {
+        _msgsToAssign = window._carryForwardEphemeralTurnFields(retained, merged.rows);
+      }
+      S.messages = _msgsToAssign;
+      setSegments(merged.segments);
+      _oldestIdx = merged.segments.length ? merged.segments[0].start : 0;
+      _syncToolCallsForLoadedMessages(_msgsToAssign, bare.session.tool_calls);
+    }
+    _messagesTruncated = true;
+    _messagesIncomplete = true;
   } finally {
     _loadingOlder = false;
   }

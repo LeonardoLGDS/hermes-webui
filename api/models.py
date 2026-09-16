@@ -2813,12 +2813,76 @@ def _interrupted_content_for(
     )
 
 
+def _interruption_time_text(ts) -> str:
+    try:
+        return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(float(ts)))
+    except (TypeError, ValueError, OSError):
+        return 'unknown'
+
+
+def _coerce_interrupted_at(interrupted_at):
+    """Return a durable cut time as an int, or ``None`` when not provable.
+
+    ``pending_started_at`` and the detection time are never cut times, so bools
+    and non-positive values are rejected.
+    """
+    if isinstance(interrupted_at, bool) or not isinstance(interrupted_at, (int, float)) \
+            or interrupted_at <= 0:
+        return None
+    return int(interrupted_at)
+
+
+def _interruption_age_suffix(interrupted_at_value, recovered_at: int) -> str:
+    """Exact age suffix shared by every interruption-marker path."""
+    if interrupted_at_value is None:
+        # Never present the start time (or the detection time) as a proven cut.
+        return (
+            f"\n\n(interruption time unknown; recovered at "
+            f"{_interruption_time_text(recovered_at)})"
+        )
+    return (
+        f"\n\n(interrupted at {_interruption_time_text(interrupted_at_value)}; "
+        f"recovered at {_interruption_time_text(recovered_at)})"
+    )
+
+
+def _refresh_interruption_age(marker: dict, base_content: str, interrupted_at) -> dict:
+    """Rebuild a marker's wording without discarding its detection time.
+
+    ``recovered_at`` (when the interruption was detected) is preserved from the
+    marker; only the resolved cut and the rendered suffix are refreshed. Used
+    when a later retry proves a cut that was unknown when the marker was first
+    materialized. A proven cut already persisted on the marker is durable
+    evidence too: when no newer proof is available (journal lost, no stream id,
+    give-up) it is retained instead of being downgraded to "unknown"
+    (R123-D).
+    """
+    recovered_at = marker.get('recovered_at')
+    if isinstance(recovered_at, bool) or not isinstance(recovered_at, (int, float)) \
+            or recovered_at <= 0:
+        recovered_at = int(time.time())
+    else:
+        recovered_at = int(recovered_at)
+    interrupted_at_value = _coerce_interrupted_at(interrupted_at)
+    if interrupted_at_value is None:
+        # Keep the marker's own proven cut; only fall back to "unknown" when
+        # neither the new evidence nor the persisted marker prove one.
+        interrupted_at_value = _coerce_interrupted_at(marker.get('interrupted_at'))
+    marker['recovered_at'] = recovered_at
+    marker['interrupted_at'] = interrupted_at_value
+    marker['content'] = base_content + _interruption_age_suffix(
+        interrupted_at_value, recovered_at,
+    )
+    return marker
+
+
 def _interrupted_recovery_marker(
     *,
     recovered_output: bool = False,
     pending_retry: bool = False,
     stream_id: str | None = None,
     pending_started_at=None,
+    interrupted_at=None,
 ) -> dict:
     """Build the standard interrupted-turn marker.
 
@@ -2832,8 +2896,14 @@ def _interrupted_recovery_marker(
     ``get_session()`` can re-attempt recovery without baking a permanent
     "no output" claim into the transcript.
 
-    The two are mutually exclusive; ``recovered_output`` wins if both are
-    set so the caller cannot accidentally re-arm retry on a successful
+    ``interrupted_at`` is the durable cut time (a real terminal/cancel/shutdown
+    journal event). It is kept distinct from ``recovered_at`` (the detection
+    time). ``pending_started_at`` is NOT a cut time and is never copied into
+    either field. When no cut time is provable the marker says so explicitly
+    instead of implying a precise interruption instant.
+
+    The two wording modes are mutually exclusive; ``recovered_output`` wins if
+    both are set so the caller cannot accidentally re-arm retry on a successful
     repair.
     """
     interruption_cause = _classify_interruption_cause(
@@ -2845,13 +2915,18 @@ def _interrupted_recovery_marker(
         pending_retry=pending_retry,
         interruption_cause=interruption_cause,
     )
+    recovered_at = int(time.time())
+    interrupted_at_value = _coerce_interrupted_at(interrupted_at)
+    content = content + _interruption_age_suffix(interrupted_at_value, recovered_at)
     marker = {
         'role': 'assistant',
         'content': content,
-        'timestamp': int(time.time()),
+        'timestamp': recovered_at,
         '_error': True,
         'type': 'interrupted',
         'interruption_cause': interruption_cause,
+        'interrupted_at': interrupted_at_value,
+        'recovered_at': recovered_at,
     }
     if pending_retry and not recovered_output:
         marker['_pending_journal_recovery'] = True
@@ -2907,6 +2982,62 @@ def _latest_user_matches_pending_text(messages, pending_text):
     return False
 
 
+def _pending_checkpoint_already_materialized(
+    messages, pending_text, timestamp, source, attachments,
+) -> bool:
+    """Return True when the pending user turn is already a durable checkpoint.
+
+    Uses the full checkpoint identity (text + timestamp + source +
+    attachments), not a latest-user text match: a historical turn that merely
+    repeats the prompt must not suppress materializing the genuinely new
+    recovered user boundary (R123-A).
+    """
+    if not isinstance(messages, list):
+        return False
+    return any(
+        _message_matches_pending_checkpoint(
+            message, pending_text, timestamp, source, attachments,
+        )
+        for message in messages
+    )
+
+
+def _recovery_row_timestamp_evidence(row):
+    """Return ``(values, conflicting, invalid_present)`` for a row's aliases.
+
+    ``timestamp`` and ``_ts`` are both timestamp evidence this module already
+    recognises. A legacy row may only adopt a journal segment whose boundary
+    times agree with the row's own evidence, so both aliases are validated;
+    self-contradicting aliases fail closed (R126-C).
+
+    An alias that is PRESENT but not a usable positive finite number
+    (``'9000'``, ``'bad'``, ``-1``, ``0``, ``True``) is not the same as an
+    ABSENT alias: silently discarding it would let invalid-present evidence
+    become absent evidence and authorize the stamp, reuse and tool ownership
+    the caller must refuse (R132-C). ``invalid_present`` reports exactly that,
+    while ``None``/missing aliases keep the supported legacy behavior.
+    """
+    values = set()
+    per_alias = []
+    invalid_present = False
+    if isinstance(row, dict):
+        for field in ('timestamp', '_ts'):
+            if field not in row:
+                continue
+            value = row.get(field)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                invalid_present = True
+                continue
+            if not math.isfinite(float(value)) or value <= 0:
+                invalid_present = True
+                continue
+            per_alias.append(float(value))
+            values.add(float(value))
+    return values, len(set(per_alias)) > 1, invalid_present
+
+
 def _partial_message_signature(message: dict) -> tuple:
     """Return a stable identity for partial assistant markers recovered on load."""
     if not isinstance(message, dict):
@@ -2958,22 +3089,139 @@ def _collapse_adjacent_duplicate_partials(messages) -> tuple[list, bool]:
     return collapsed, changed
 
 
-def _find_existing_assistant_for_journal_content(
+_RECOVERY_IDENTITY_FIELD = '_recovery_identity'
+
+# A durable recovery identity is ``<stream>:<kind>:<boundary>``. Every part is
+# required: a bare legacy constant (``unknown``), a missing kind
+# (``stream:seq1``), a non-positive boundary (``seq0``/``t0``) and a reversed
+# span (``seq4-2``) are all boundary-free or malformed and must never be
+# treated as authoritative. Validating the whole shape (not just a regex on
+# the suffix) matters because a persisted ``stream:seq1`` would otherwise pass
+# a suffix-only check and authorize dropping a distinct ambiguous row
+# (R126-B).
+_RECOVERY_IDENTITY_KINDS = frozenset({
+    'assistant',
+    'reasoning',
+    'tool',
+    'tool_anchor',
+})
+_RECOVERY_IDENTITY_SPAN_RE = re.compile(
+    r'^(?:seq[1-9]\d*(?:-[1-9]\d*)?|t\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?)$'
+)
+
+
+def _recovery_identity_boundary_values(span: str):
+    """Return the positive, finite, ordered boundary values for ``span``.
+
+    The persisted grammar is enforced lexically before any numeric conversion:
+    a malformed span (``tnan``, ``tinf``, ``t 1``, ``t+1``, ``t1e2``,
+    ``seq01``) is not a journal boundary this module ever writes, so it must not
+    be granted identity even though ``float()`` would parse most of them.
+    Finite and ordered checks are still required for shapes the grammar allows:
+    a long digit string can still overflow to ``inf`` (R126-B / R132-B).
+    """
+    if not isinstance(span, str) or not _RECOVERY_IDENTITY_SPAN_RE.match(span):
+        return None
+    if span.startswith('seq'):
+        raw_values = span[3:].split('-')
+        integer_boundary = True
+    else:
+        raw_values = span[1:].split('-')
+        integer_boundary = False
+    values = []
+    for raw in raw_values:
+        try:
+            value = int(raw) if integer_boundary else float(raw)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(value) or value <= 0:
+            return None
+        values.append(value)
+    if len(values) == 2 and values[1] < values[0]:
+        return None
+    return values
+
+
+def _is_authoritative_recovery_identity(identity) -> bool:
+    """Return True only for a complete ``<stream>:<kind>:<boundary>`` identity."""
+    text = str(identity or '')
+    if not text:
+        return False
+    parts = text.rsplit(':', 2)
+    if len(parts) != 3:
+        return False
+    stream_id, kind, span = parts
+    if not stream_id or kind not in _RECOVERY_IDENTITY_KINDS:
+        return False
+    return _recovery_identity_boundary_values(span) is not None
+
+
+def _journal_recovery_identity(
+    stream_id: str | None,
+    *,
+    kind: str,
+    first_seq=None,
+    last_seq=None,
+    first_at=None,
+    last_at=None,
+) -> str | None:
+    """Stable identity for one recovered journal segment.
+
+    Composed from the stream id, the segment kind, and the journal event
+    boundary (``seq`` span) that produced the row. Journal ``seq`` is monotonic
+    and durable, so repeated load/finalize passes over the same journal derive
+    the same identity and can reuse the row they created before instead of
+    appending a copy.
+
+    A text hash is explicitly insufficient: two legitimate same-text reasoning
+    segments sit at different journal boundaries and must stay distinct, while a
+    per-stream-only key cannot represent the several segments one stream may own.
+    ``seq`` is preferred; synthetic/legacy events fall back to the event
+    ``created_at`` boundary. When neither boundary exists there is no
+    authoritative identity at all, so this returns ``None``: callers must treat
+    boundary-free evidence as legacy-ambiguous (preserve the row, diagnose it)
+    instead of collapsing separate segments onto a shared constant key.
+    """
+    sid = str(stream_id or '')
+    if not sid:
+        return None
+    if first_seq is not None:
+        span = f"seq{int(first_seq)}"
+        if last_seq is not None and int(last_seq) != int(first_seq):
+            span = f"seq{int(first_seq)}-{int(last_seq)}"
+    elif first_at is not None:
+        span = f"t{float(first_at):.6f}"
+        if last_at is not None and float(last_at) != float(first_at):
+            span = f"t{float(first_at):.6f}-{float(last_at):.6f}"
+    else:
+        # No durable boundary -> no authoritative identity. Returning a
+        # constant key here would let two distinct boundary-free segments look
+        # "equal" and silently collapse one of them (F1/F2).
+        return None
+    return f"{sid}:{str(kind)}:{span}"
+
+
+def _find_journal_content_candidate_indexes(
     session,
     content: str,
     *,
     max_index: int | None = None,
-    excluded_indexes: set[int] | None = None,
-) -> int | None:
+) -> list[int]:
+    """Return content-matched assistant indexes in reuse-preference order.
+
+    One pass over the transcript, so ownership rejection can walk the
+    candidates without restarting a whole-history scan per rejected owner
+    (R123-E): exact matches first, in transcript order, then prefix
+    (substring) matches. Callers still decide ownership per candidate.
+    """
     candidate = _normalize_journal_recovery_text(content)
     if not candidate:
-        return None
+        return []
     messages = session.messages or []
     stop = len(messages) if max_index is None else min(len(messages), max_index)
-    substring_match = None
+    exact_matches: list[int] = []
+    substring_matches: list[int] = []
     for idx in range(stop):
-        if excluded_indexes and idx in excluded_indexes:
-            continue
         message = messages[idx]
         if not isinstance(message, dict) or message.get('role') != 'assistant':
             continue
@@ -2983,20 +3231,21 @@ def _find_existing_assistant_for_journal_content(
         if not existing:
             continue
         if existing == candidate:
-            return idx
-        if substring_match is None and len(candidate) >= 24 and candidate in existing:
-            substring_match = idx
-    return substring_match
+            exact_matches.append(idx)
+        elif len(candidate) >= 24 and candidate in existing:
+            substring_matches.append(idx)
+    return exact_matches + substring_matches
 
 
-def _journal_tool_already_present(
+def _find_journal_tool_card(
     session,
     name: str,
     preview: str,
     *,
     stream_id: str | None = None,
-) -> bool:
-    """Return True when an equivalent tool card already exists.
+    identity: str | None = None,
+) -> dict | None:
+    """Return the existing equivalent recovered tool card, or ``None``.
 
     Matching rule:
 
@@ -3005,6 +3254,10 @@ def _journal_tool_already_present(
       collapse against it only when both stream ids match — otherwise a
       legitimately-repeated tool (e.g. a second ``terminal: ls`` in a
       different turn) would be dropped.
+    * If both cards carry a durable ``_recovery_identity``, they must be the
+      same journal boundary. Two same-name/same-preview tools at different
+      journal positions are genuinely new activity, not a replay, so they must
+      not be collapsed.
     * If the existing tool card has no ``_recovered_stream_id`` (a live tool
       card, or a tool card carried over from a core transcript that pre-dates
       stream-id tagging), the legacy name+preview match still wins.  This
@@ -3034,8 +3287,45 @@ def _journal_tool_already_present(
             # over from the core transcript) still match.
             if existing_stream and str(existing_stream) != candidate_stream:
                 continue
-        return True
-    return False
+        if identity:
+            existing_identity = tool_call.get(_RECOVERY_IDENTITY_FIELD)
+            if existing_identity and str(existing_identity) != str(identity):
+                # Same name/preview but a different journal boundary: this is a
+                # legitimate new tool occurrence, not a replayed one.
+                continue
+        return tool_call
+    return None
+
+
+def _journal_tool_already_present(
+    session,
+    name: str,
+    preview: str,
+    *,
+    stream_id: str | None = None,
+) -> bool:
+    """Return True when an equivalent tool card already exists."""
+    return _find_journal_tool_card(
+        session, name, preview, stream_id=stream_id,
+    ) is not None
+
+
+def _find_recovered_tool_card_by_identity(session, identity: str | None) -> dict | None:
+    """Return the recovered tool card for an exact recovery identity, or None.
+
+    Used for replay idempotence on caller paths that do not pass
+    ``dedupe_existing``: re-running recovery for the same journal boundary must
+    reuse the card it created rather than appending a duplicate.
+    """
+    if not identity:
+        return None
+    wanted = str(identity)
+    for tool_call in session.tool_calls or []:
+        if not isinstance(tool_call, dict):
+            continue
+        if str(tool_call.get(_RECOVERY_IDENTITY_FIELD) or '') == wanted:
+            return tool_call
+    return None
 
 
 def _run_journal_has_visible_output(session, stream_id: str | None) -> bool:
@@ -3265,6 +3555,109 @@ def _materialize_unsaved_gateway_terminal_error(
     return True
 
 
+def _journal_replay_reasoning_segments(events, stream_id: str | None) -> dict:
+    """Index journal reasoning evidence the way replay actually segments it.
+
+    Replay concatenates every adjacent reasoning event into ONE row segment and
+    closes that segment on the same events that flush a row (tools, interim
+    assistant text, terminals). Indexing individual event payloads therefore
+    does not describe the replayed transcript: an ``A``+``B`` segment has text
+    ``AB``, which a per-event index cannot see, and a legacy row could then be
+    stamped with a boundary the journal never produced. Each entry is
+    ``{'identity': <durable segment identity>, 'times': (<event created_at>, ...)}``
+    keyed by normalized segment text (R126-C).
+    """
+    segments: dict[str, list[dict]] = {}
+    reasoning_parts: list[str] = []
+    content_parts: list[str] = []
+    window_state = {'first_seq': None, 'last_seq': None,
+                    'first_at': None, 'last_at': None, 'times': []}
+
+    def note(event) -> None:
+        seq = event.get('seq')
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            seq = None
+        at = event.get('created_at')
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            at = None
+        if window_state['first_seq'] is None and seq is not None:
+            window_state['first_seq'] = seq
+        if seq is not None:
+            window_state['last_seq'] = seq
+        if window_state['first_at'] is None and at is not None:
+            window_state['first_at'] = float(at)
+        if at is not None:
+            window_state['last_at'] = float(at)
+            window_state['times'].append(float(at))
+
+    def flush() -> None:
+        reasoning = _normalize_journal_recovery_text(''.join(reasoning_parts))
+        content = ''.join(content_parts).strip()
+        state = dict(window_state)
+        reasoning_parts.clear()
+        content_parts.clear()
+        window_state['first_seq'] = None
+        window_state['last_seq'] = None
+        window_state['first_at'] = None
+        window_state['last_at'] = None
+        window_state['times'] = []
+        if not reasoning:
+            return
+        identity = _journal_recovery_identity(
+            stream_id,
+            kind=('assistant' if content else 'reasoning'),
+            first_seq=state['first_seq'],
+            last_seq=state['last_seq'],
+            first_at=state['first_at'],
+            last_at=state['last_at'],
+        )
+        if identity is None:
+            return
+        segments.setdefault(reasoning, []).append({
+            'identity': identity,
+            'times': tuple(state['times']),
+        })
+
+    for event in events:
+        name = str(event.get('event') or event.get('type') or '')
+        payload = event.get('payload') if isinstance(event.get('payload'), dict) else {}
+        if name == 'reasoning':
+            text = str(
+                payload.get('text') or payload.get('reasoning') or payload.get('thinking') or ''
+            )
+            if not text:
+                continue
+            note(event)
+            reasoning_parts.append(text)
+            continue
+        if name == 'token':
+            text = str(payload.get('text') or '')
+            if not text:
+                continue
+            note(event)
+            content_parts.append(text)
+            continue
+        if name == 'interim_assistant':
+            if payload.get('already_streamed'):
+                flush()
+                continue
+            text = str(payload.get('text') or '').strip()
+            if not text:
+                continue
+            note(event)
+            if content_parts and not ''.join(content_parts).endswith(('\n', ' ')):
+                content_parts.append('\n\n')
+            content_parts.append(text)
+            flush()
+            continue
+        if name == 'tool' or name in {'done', 'stream_end', 'cancel', 'apperror', 'error'}:
+            flush()
+            continue
+        # ``tool_complete`` and every other event do not close a replay segment.
+    flush()
+    return segments
+
+
 def _recover_journaled_output_and_terminal_error(
     session,
     stream_id: str | None,
@@ -3283,6 +3676,9 @@ def _recover_journaled_output_and_terminal_error(
         stream_id,
         terminal_recovery,
     )
+    # Ordinary replay and every finalization caller converge here; diagnose
+    # legacy ambiguity at this boundary too, not only on the lazy-retry path.
+    _audit_recovery_invariants(session, context="journal replay boundary")
     return recovered_output, terminal_error_recovered
 
 
@@ -3319,6 +3715,39 @@ def _journal_is_still_arriving(session, stream_id: str | None) -> bool:
         return False
 
 
+def _journal_interruption_cut_time(session, stream_id: str | None):
+    """Return the durable cut time for a dead stream, or ``None``.
+
+    Only a real terminal/cancel/shutdown journal event proves *when* the turn
+    was cut. ``pending_started_at`` is when the turn started, NOT when it was
+    interrupted, so it is deliberately never used as the cut time here.
+    """
+    if not stream_id:
+        return None
+    try:
+        from api.run_journal import read_run_events
+
+        journal = read_run_events(session.session_id, stream_id)
+    except Exception:
+        logger.debug(
+            "Session %s: failed to read journal for interruption cut time (stream %s)",
+            getattr(session, 'session_id', '?'),
+            stream_id,
+            exc_info=True,
+        )
+        return None
+    for event in journal.get('events') or []:
+        if not isinstance(event, dict):
+            continue
+        name = str(event.get('event') or event.get('type') or '')
+        if name not in {'cancel', 'shutdown', 'apperror', 'error', 'stream_end'}:
+            continue
+        at = event.get('created_at')
+        if isinstance(at, (int, float)) and not isinstance(at, bool) and at > 0:
+            return float(at)
+    return None
+
+
 def _append_journaled_partial_output(
     session,
     stream_id: str | None,
@@ -3352,6 +3781,14 @@ def _append_journaled_partial_output(
     if not events:
         return False
 
+    # Journal reasoning boundaries for THIS stream, keyed by normalized replay
+    # segment text. A legacy transcript row predates durable identities, so it
+    # may only adopt an identity the replayed transcript actually produced: two
+    # same-text segments stay ambiguous, the mapping must be unique without
+    # manufacturing uniqueness from the proposed stamp, and a row whose own
+    # timestamp evidence conflicts with the segment must not be re-stamped.
+    reasoning_segments_by_text = _journal_replay_reasoning_segments(events, stream_id)
+
     appended_any = False
     assistant_parts: list[str] = []
     reasoning_parts: list[str] = []
@@ -3360,46 +3797,142 @@ def _append_journaled_partial_output(
     recovered_tool_calls: list[dict] = []
     initial_message_count = len(session.messages or [])
     claimed_existing_assistant_indexes: set[int] = set()
+    assistant_first_seq: int | None = None
+    assistant_last_seq: int | None = None
+    assistant_first_at: float | None = None
+    assistant_last_at: float | None = None
+    tool_segment_first_seq: int | None = None
+    tool_segment_first_at: float | None = None
 
-    def content_match_can_receive_reasoning(existing_idx: int) -> bool:
+    ownership_evidence_cache: dict = {}
+
+    def _ownership_evidence() -> dict:
+        """Precompute owner / later-boundary evidence for the fixed prefix.
+
+        The transcript prefix ``[0, initial_message_count)`` cannot change while
+        this recovery call runs (new rows only append at the end), so the
+        nearest preceding user and the next disqualifying user boundary are
+        resolved ONCE and shared by every candidate. Recomputing them per
+        candidate is quadratic on a long multi-assistant turn and made
+        ownership rejection O(n^2) (R126-E). Rows are read once here and once
+        by the content-candidate scan, which keeps the deterministic bound
+        linear in the transcript size.
+        """
+        cached = ownership_evidence_cache.get('prefix')
+        if cached is not None:
+            return cached
         messages = session.messages or []
-        owner_idx = None
-        for candidate_idx in range(existing_idx - 1, -1, -1):
-            candidate = messages[candidate_idx]
-            if isinstance(candidate, dict) and candidate.get('role') == 'user':
-                owner_idx = candidate_idx
-                break
+        stop = min(len(messages), initial_message_count)
+        pending_text = _normalize_journal_recovery_text(session.pending_user_message)
+        rows: list = []
+        is_user: list[bool] = []
+        is_recovered: list[bool] = []
+        matches_checkpoint: list[bool] = []
+        for idx in range(stop):
+            row = messages[idx]
+            rows.append(row)
+            user = isinstance(row, dict) and row.get('role') == 'user'
+            is_user.append(user)
+            is_recovered.append(bool(isinstance(row, dict) and row.get('_recovered')))
+            matches_checkpoint.append(
+                bool(user and pending_text)
+                and _message_matches_pending_checkpoint(
+                    row,
+                    session.pending_user_message,
+                    session.pending_started_at,
+                    session.pending_user_source,
+                    session.pending_attachments,
+                )
+            )
+        nearest_preceding_user: list = [None] * (stop + 1)
+        preceding = None
+        for idx in range(stop):
+            nearest_preceding_user[idx] = preceding
+            if is_user[idx]:
+                preceding = idx
+        nearest_preceding_user[stop] = preceding
+        next_user_from: list = [None] * (stop + 1)
+        next_disqualifying_user_from: list = [None] * (stop + 1)
+        following_user = None
+        following_disqualifying = None
+        for idx in range(stop - 1, -1, -1):
+            if is_user[idx]:
+                following_user = idx
+                if not (is_recovered[idx] and matches_checkpoint[idx]):
+                    following_disqualifying = idx
+            next_user_from[idx] = following_user
+            next_disqualifying_user_from[idx] = following_disqualifying
+        cached = {
+            'stop': stop,
+            'rows': rows,
+            'owner_of': nearest_preceding_user,
+            'next_user_from': next_user_from,
+            'next_disqualifying_user_from': next_disqualifying_user_from,
+        }
+        ownership_evidence_cache['prefix'] = cached
+        return cached
+
+    def content_match_belongs_to_pending_turn(existing_idx: int) -> bool:
+        """Return True only when a content-matched assistant row is ''ours''.
+
+        Text equality is non-authoritative: a historical answer with the same
+        (or a 200-char-prefix-equal) text belongs to another turn and must
+        never be reused for the pending one. Ownership is proven only when the
+        nearest preceding user message matches the pending checkpoint. A bare
+        owner-text match — including a core transcript whose owner row omits
+        the pending timestamp — can never establish turn identity, and the
+        absence of a durable terminal is NOT evidence that the stream is live
+        (a crash leaves tokens and tools with no terminal record). It fails
+        closed so the new answer is materialized instead (R132-A). A durable
+        ``_recovery_identity`` on the matched row is authoritative proof that it
+        belongs to a *different* recovery segment — same-identity reuse already
+        happened above, so content shape can never collapse it.
+        """
+        evidence = _ownership_evidence()
+        if not (0 <= existing_idx < evidence['stop']):
+            return False
+        existing_message = evidence['rows'][existing_idx]
+        if not isinstance(existing_message, dict):
+            return False
+        if existing_message.get(_RECOVERY_IDENTITY_FIELD):
+            return False
+        owner_idx = evidence['owner_of'][existing_idx]
         if owner_idx is None:
             return False
 
         pending_text = _normalize_journal_recovery_text(session.pending_user_message)
-        if pending_text and not _message_matches_pending_checkpoint(
-            messages[owner_idx],
+        owner = evidence['rows'][owner_idx]
+        owner_is_checkpoint = bool(pending_text) and _message_matches_pending_checkpoint(
+            owner,
             session.pending_user_message,
             session.pending_started_at,
             session.pending_user_source,
             session.pending_attachments,
-        ):
+        )
+        if pending_text and not owner_is_checkpoint:
+            # Ownership must be proven by the current-turn checkpoint, never by
+            # text equality alone. A historical turn that merely repeats the
+            # prompt must not authorize reusing its answer for the pending turn.
+            # A core transcript that omits the pending timestamp cannot prove
+            # which turn its bare answer belongs to, and the absence of a
+            # durable terminal is not evidence of liveness (a crash leaves
+            # tokens and tools with no terminal record at all). Fail closed and
+            # let the new answer be materialized separately (R132-A attacks 1
+            # and 3: a terminal-less core must not donate historical output).
             return False
 
-        for candidate_idx in range(existing_idx + 1, initial_message_count):
-            candidate = messages[candidate_idx]
-            if not isinstance(candidate, dict) or candidate.get('role') != 'user':
-                continue
-            candidate_text = _normalize_journal_recovery_text(candidate.get('content'))
-            candidate_matches_checkpoint = pending_text and _message_matches_pending_checkpoint(
-                candidate,
-                session.pending_user_message,
-                session.pending_started_at,
-                session.pending_user_source,
-                session.pending_attachments,
-            )
-            if candidate_matches_checkpoint and candidate.get('_recovered'):
-                continue
-            if pending_text and candidate_text == pending_text:
-                return False
-            return False
-        return True
+        # A later user boundary means the matched row belongs to an earlier
+        # turn than the pending checkpoint. A recovered boundary row carrying
+        # the SAME current-turn checkpoint is this turn's own user boundary
+        # materialized by a previous/current recovery pass and does not
+        # disqualify the match. Only checkpoint-proven ownership reaches this
+        # point: a bare text match failed closed above, so a fresh recovered
+        # boundary can never be skipped to donate a historical answer. Both
+        # "next user" and "next disqualifying user" were precomputed for every
+        # index, so this decision is O(1) per candidate (R126-E).
+        forward_idx = existing_idx + 1
+        blocked = evidence['next_disqualifying_user_from'][forward_idx]
+        return blocked is None
 
     def append_context_projection(message: dict) -> None:
         context_projection = dict(message)
@@ -3415,31 +3948,107 @@ def _append_journaled_partial_output(
         message['reasoning'] = reasoning
         return True
 
+    def _note_assistant_event(event) -> None:
+        """Track the journal seq/created_at span feeding the current buffer."""
+        nonlocal assistant_first_seq, assistant_last_seq
+        nonlocal assistant_first_at, assistant_last_at
+        seq = event.get('seq')
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 1:
+            seq = None
+        at = event.get('created_at')
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            at = None
+        if assistant_first_seq is None and seq is not None:
+            assistant_first_seq = seq
+        if seq is not None:
+            assistant_last_seq = seq
+        if assistant_first_at is None and at is not None:
+            assistant_first_at = float(at)
+        if at is not None:
+            assistant_last_at = float(at)
+
+    def _reset_assistant_boundary() -> None:
+        nonlocal assistant_first_seq, assistant_last_seq
+        nonlocal assistant_first_at, assistant_last_at
+        assistant_first_seq = None
+        assistant_last_seq = None
+        assistant_first_at = None
+        assistant_last_at = None
+
+    def _reset_tool_segment() -> None:
+        nonlocal tool_segment_first_seq, tool_segment_first_at
+        tool_segment_first_seq = None
+        tool_segment_first_at = None
+
     def flush_assistant() -> int | None:
         nonlocal appended_any, assistant_parts, reasoning_parts
         nonlocal assistant_started_at, current_assistant_idx
         content = ''.join(assistant_parts).strip()
         reasoning = ''.join(reasoning_parts).strip()
+        flush_first_seq, flush_last_seq = assistant_first_seq, assistant_last_seq
+        flush_first_at, flush_last_at = assistant_first_at, assistant_last_at
         assistant_parts = []
         reasoning_parts = []
         if not content and not reasoning:
             return current_assistant_idx
-        if dedupe_existing and content:
-            search_excluded = set(claimed_existing_assistant_indexes)
+        # Visible text/reasoning ends any tool-only segment: the next tool-only
+        # run starts a fresh recovery-identity boundary.
+        _reset_tool_segment()
+        identity = _journal_recovery_identity(
+            stream_id,
+            kind=('assistant' if content else 'reasoning'),
+            first_seq=flush_first_seq,
+            last_seq=flush_last_seq,
+            first_at=flush_first_at,
+            last_at=flush_last_at,
+        )
+        _reset_assistant_boundary()
+        if identity:
+            # Idempotence is identity-scoped: re-running recovery for the SAME
+            # journal boundary must reuse the row it already created, no matter
+            # which caller path invoked it. `dedupe_existing` governs the
+            # legacy text/content collapse against pre-existing transcript rows,
+            # not this recovery's own durable identity, so replaying with
+            # dedupe True and False converges on the same row set.
+            for existing_idx in range(initial_message_count):
+                existing_message = session.messages[existing_idx]
+                if not isinstance(existing_message, dict):
+                    continue
+                if existing_message.get(_RECOVERY_IDENTITY_FIELD) != identity:
+                    continue
+                claimed_existing_assistant_indexes.add(existing_idx)
+                current_assistant_idx = existing_idx
+                assistant_started_at = None
+                if reasoning and attach_display_reasoning(existing_message, reasoning):
+                    appended_any = True
+                if content and not str(existing_message.get('content') or '').strip():
+                    existing_message['content'] = content
+                    appended_any = True
+                if content:
+                    append_context_projection(existing_message)
+                return existing_idx
+        if content:
+            # Visible-row reconciliation is NOT gated on ``dedupe_existing``:
+            # a pre-identity recovered row for this stream with the same
+            # content and a current-turn owner checkpoint is the row this
+            # journal segment materialized before durable identities existed,
+            # so both flags must converge on the same transcript (R123-C).
+            # Candidates are enumerated in ONE pass; ownership is still
+            # required for EVERY content-based reuse — otherwise a new
+            # interrupted answer whose text equals a historical answer is
+            # silently merged into the old turn (F6) — and a rejected owner is
+            # never rescanned from the top (R123-E).
             existing_idx = None
-            while True:
-                candidate_idx = _find_existing_assistant_for_journal_content(
-                    session,
-                    content,
-                    max_index=initial_message_count,
-                    excluded_indexes=search_excluded,
-                )
-                if candidate_idx is None:
-                    break
-                if not reasoning or content_match_can_receive_reasoning(candidate_idx):
+            for candidate_idx in _find_journal_content_candidate_indexes(
+                session,
+                content,
+                max_index=initial_message_count,
+            ):
+                if candidate_idx in claimed_existing_assistant_indexes:
+                    continue
+                if content_match_belongs_to_pending_turn(candidate_idx):
                     existing_idx = candidate_idx
                     break
-                search_excluded.add(candidate_idx)
             if existing_idx is not None:
                 claimed_existing_assistant_indexes.add(existing_idx)
                 current_assistant_idx = existing_idx
@@ -3450,12 +4059,33 @@ def _append_journaled_partial_output(
                     if attach_display_reasoning(existing_message, reasoning):
                         appended_any = True
                 return existing_idx
-        if dedupe_existing and reasoning and not content:
+        if reasoning and not content:
+            # Legacy reconciliation is deliberately NOT gated on
+            # ``dedupe_existing``: a pre-identity recovered row for this stream
+            # with the exact same reasoning text is the row this journal
+            # segment materialized before durable identities existed, so both
+            # flags must converge on the same transcript. When the match is
+            # unambiguous we adopt the durable identity onto the legacy row so
+            # subsequent passes are identity-scoped; ambiguous matches are left
+            # unstamped and diagnosed instead of guessing.
+            legacy_candidate_indexes: list[int] = []
             for existing_idx in range(initial_message_count):
                 if existing_idx in claimed_existing_assistant_indexes:
                     continue
                 existing_message = session.messages[existing_idx]
                 if not isinstance(existing_message, dict):
+                    continue
+                existing_identity = existing_message.get(_RECOVERY_IDENTITY_FIELD)
+                if existing_identity:
+                    # Durable identity: collapse only the exact same journal
+                    # segment. A different boundary is a legitimate second
+                    # same-text reasoning segment and must be appended, not
+                    # merged away.
+                    if identity and str(existing_identity) == str(identity):
+                        claimed_existing_assistant_indexes.add(existing_idx)
+                        current_assistant_idx = existing_idx
+                        assistant_started_at = None
+                        return existing_idx
                     continue
                 if (
                     existing_message.get('_recovered_from_run_journal')
@@ -3464,10 +4094,161 @@ def _append_journaled_partial_output(
                     and not str(existing_message.get('content') or '').strip()
                     and str(existing_message.get('reasoning') or '').strip() == reasoning
                 ):
-                    claimed_existing_assistant_indexes.add(existing_idx)
-                    current_assistant_idx = existing_idx
+                    legacy_candidate_indexes.append(existing_idx)
+            if legacy_candidate_indexes:
+                reuse_idx = legacy_candidate_indexes[0]
+                if not identity:
+                    claimed_existing_assistant_indexes.add(reuse_idx)
+                    current_assistant_idx = reuse_idx
                     assistant_started_at = None
-                    return existing_idx
+                    return reuse_idx
+                # Validate the guessed mapping against the ACTUAL replay
+                # segments and the row's own timestamp evidence before making
+                # it durable. The candidate set is exactly the journal segments
+                # that replayed this text: the proposed stamp is NOT added to
+                # it, because manufacturing uniqueness would let an unbacked
+                # identity win. A row that can belong to none of those segments
+                # (its timestamp evidence conflicts with every one of them) is
+                # disproven: it must not be reused for this segment nor own the
+                # tools that follow, or a refused mapping would still authorize
+                # ownership. It is preserved separately instead (R126-C).
+                segments = reasoning_segments_by_text.get(
+                    _normalize_journal_recovery_text(reasoning), [],
+                )
+                candidate_identities = {
+                    str(segment.get('identity'))
+                    for segment in segments
+                    if segment.get('identity')
+                }
+                matching_times = {
+                    float(at)
+                    for segment in segments
+                    if str(segment.get('identity')) == str(identity)
+                    for at in segment.get('times') or ()
+                    if at is not None
+                }
+                segment_times = {
+                    float(at)
+                    for segment in segments
+                    for at in segment.get('times') or ()
+                    if at is not None
+                }
+                (
+                    row_times,
+                    conflicting_aliases,
+                    invalid_aliases,
+                ) = _recovery_row_timestamp_evidence(session.messages[reuse_idx])
+                unique_segment = candidate_identities == {str(identity)}
+                timestamp_conflict = (
+                    invalid_aliases
+                    or conflicting_aliases
+                    or (
+                        bool(row_times) and bool(matching_times)
+                        and not (row_times & matching_times)
+                    )
+                )
+                # A present-but-invalid alias is not absent evidence: it must
+                # not silently authorize the stamp, reuse and tool ownership a
+                # conflicting alias would refuse (R132-C fail-open edge).
+                row_disproven = (
+                    invalid_aliases
+                    or conflicting_aliases
+                    or (
+                        bool(row_times) and bool(segment_times)
+                        and not (row_times & segment_times)
+                    )
+                )
+                if (
+                    len(legacy_candidate_indexes) == 1
+                    and unique_segment
+                    and not timestamp_conflict
+                ):
+                    session.messages[reuse_idx][_RECOVERY_IDENTITY_FIELD] = identity
+                    logger.warning(
+                        "Session %s: reconciling legacy recovered row under "
+                        "journal segment %s by stream+text (no durable "
+                        "boundary on the existing row); flagging legacy "
+                        "identity ambiguity for a repair pass",
+                        getattr(session, 'session_id', '?'),
+                        identity,
+                    )
+                    claimed_existing_assistant_indexes.add(reuse_idx)
+                    current_assistant_idx = reuse_idx
+                    assistant_started_at = None
+                    return reuse_idx
+                # A mapping that cannot be stamped may still be adoptable
+                # WITHOUT stamping in the narrow idempotence shapes the frozen
+                # writeback fixtures pin: a legacy duplicated array (every
+                # candidate byte-identical) with one matching segment must not
+                # grow a third copy, and a single row whose timestamp evidence
+                # is consistent with THIS segment may be the row that segment
+                # already materialized while another same-text segment exists.
+                # Everything else -- no timestamp evidence with several
+                # segments, or several DISTINCT candidate rows -- is genuinely
+                # ambiguous and must materialize a separate authoritative row so
+                # a new tool can never be attached to an unproven legacy row
+                # (R132-C shapes 1 and 3).
+                candidates_are_identical = all(
+                    session.messages[idx] == session.messages[reuse_idx]
+                    for idx in legacy_candidate_indexes
+                )
+                adopt_without_stamp = (
+                    not timestamp_conflict
+                    and not row_disproven
+                    and (
+                        (len(legacy_candidate_indexes) > 1 and candidates_are_identical)
+                        or (len(legacy_candidate_indexes) == 1 and bool(row_times))
+                    )
+                )
+                if adopt_without_stamp:
+                    logger.warning(
+                        "Session %s: adopting legacy recovered row for journal "
+                        "segment %s without stamping (%d candidate row(s), %d "
+                        "candidate journal identity/identities, timestamp "
+                        "evidence %s consistent with this segment); flagging "
+                        "legacy identity ambiguity for a repair pass",
+                        getattr(session, 'session_id', '?'),
+                        identity,
+                        len(legacy_candidate_indexes),
+                        len(candidate_identities),
+                        sorted(row_times),
+                    )
+                    claimed_existing_assistant_indexes.add(reuse_idx)
+                    current_assistant_idx = reuse_idx
+                    assistant_started_at = None
+                    return reuse_idx
+                if row_disproven:
+                    logger.warning(
+                        "Session %s: refusing to reuse legacy recovered row for "
+                        "journal segment %s (row timestamp evidence %s conflicts "
+                        "with every matching journal segment %s); keeping the row "
+                        "separate, materializing the authoritative journal row "
+                        "and flagging legacy identity ambiguity for a repair pass",
+                        getattr(session, 'session_id', '?'),
+                        identity,
+                        sorted(row_times),
+                        sorted(segment_times),
+                    )
+                else:
+                    logger.warning(
+                        "Session %s: refusing to stamp legacy recovered row "
+                        "with journal segment %s (%d candidate journal "
+                        "identity/identities, timestamp_conflict=%s, "
+                        "invalid_aliases=%s); keeping the row separate, "
+                        "materializing the authoritative journal row and "
+                        "flagging legacy identity ambiguity for a repair pass",
+                        getattr(session, 'session_id', '?'),
+                        identity,
+                        len(candidate_identities),
+                        timestamp_conflict,
+                        invalid_aliases,
+                    )
+                # A refused or ambiguous mapping authorizes NEITHER reuse of the
+                # uncertain row NOR ownership of the tools that follow it. Fall
+                # through so the authoritative journal segment is materialized
+                # separately and the new tool stays attached to that new row
+                # (R132-C refusal shapes; the old code claimed the legacy row
+                # here and donated it the new tool).
         timestamp = int(assistant_started_at or time.time())
         recovered_assistant = {
             'role': 'assistant',
@@ -3476,6 +4257,8 @@ def _append_journaled_partial_output(
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
         }
+        if identity:
+            recovered_assistant[_RECOVERY_IDENTITY_FIELD] = identity
         attach_display_reasoning(recovered_assistant, reasoning)
         session.messages.append(recovered_assistant)
         append_context_projection(recovered_assistant)
@@ -3484,7 +4267,12 @@ def _append_journaled_partial_output(
         appended_any = True
         return current_assistant_idx
 
-    def ensure_assistant_anchor(created_at: float | None = None) -> int:
+    def ensure_assistant_anchor(
+        created_at: float | None = None,
+        *,
+        identity_seq=None,
+        identity_at=None,
+    ) -> int:
         nonlocal appended_any, current_assistant_idx
         idx = flush_assistant()
         if idx is not None:
@@ -3492,18 +4280,35 @@ def _append_journaled_partial_output(
         # A stream can start with tools before any text. Keep those tools
         # visible after restart with an empty recovered assistant anchor instead
         # of inventing synthetic progress prose.
-        #
-        # Dedup guard (#3875): reuse an existing empty recovered anchor for THIS
-        # stream instead of appending a fresh one. The lazy read-side retry path
-        # (_retry_journal_recovery_in_place) re-runs this recovery on repeated
-        # get_session() calls, and a tool-first stream that never emitted text
-        # has no content to dedup on (flush_assistant() returns early on empty),
-        # so without this guard each retry — and each distinct interrupted stream
-        # over the session's life — appends another empty anchor. A session that
-        # was interrupted-and-recovered many times then accumulates thousands of
-        # empty content-less assistant rows, bloating the file and (combined with
-        # the render path) painting the transcript blank. One anchor per stream
-        # is all that's needed to host its recovered tool cards.
+        identity = _journal_recovery_identity(
+            stream_id,
+            kind='tool_anchor',
+            first_seq=identity_seq,
+            first_at=identity_at if identity_at is not None else created_at,
+        )
+        # Identity guard (#3875/r119): reuse the anchor for THIS recovery
+        # segment. The identity comes from the journal boundary, so repeated
+        # load/finalize passes over the same journal reuse one row while a new
+        # tool-only segment (new boundary) can still anchor separately.
+        if identity:
+            for _existing_idx in range(len(session.messages) - 1, -1, -1):
+                _m = session.messages[_existing_idx]
+                if (
+                    isinstance(_m, dict)
+                    and _m.get(_RECOVERY_IDENTITY_FIELD) == identity
+                ):
+                    current_assistant_idx = _existing_idx
+                    return _existing_idx
+        # Dedup guard (#3875 legacy fallback): reuse an existing empty recovered
+        # anchor for THIS stream instead of appending a fresh one. The lazy
+        # read-side retry path (_retry_journal_recovery_in_place) re-runs this
+        # recovery on repeated get_session() calls, and a tool-first stream
+        # that never emitted text has no content to dedup on, so without this
+        # guard each retry — and each distinct interrupted stream over the
+        # session's life — appends another empty anchor. One anchor per stream
+        # is all that's needed to host its recovered tool cards; pre-identity
+        # rows have no boundary to key on, so the stream-scoped scan stays
+        # reachable for upgrade replay.
         for _existing_idx in range(len(session.messages) - 1, -1, -1):
             _m = session.messages[_existing_idx]
             if not isinstance(_m, dict):
@@ -3517,13 +4322,16 @@ def _append_journaled_partial_output(
             ):
                 current_assistant_idx = _existing_idx
                 return _existing_idx
-        session.messages.append({
+        anchor = {
             'role': 'assistant',
             'content': '',
             'timestamp': int(created_at or time.time()),
             '_recovered_from_run_journal': True,
             '_recovered_stream_id': stream_id,
-        })
+        }
+        if identity:
+            anchor[_RECOVERY_IDENTITY_FIELD] = identity
+        session.messages.append(anchor)
         current_assistant_idx = len(session.messages) - 1
         appended_any = True
         return current_assistant_idx
@@ -3538,6 +4346,7 @@ def _append_journaled_partial_output(
             )
             if not text:
                 continue
+            _note_assistant_event(event)
             if not assistant_parts and not reasoning_parts and assistant_started_at is None:
                 assistant_started_at = created_at or time.time()
             reasoning_parts.append(text)
@@ -3546,6 +4355,7 @@ def _append_journaled_partial_output(
             text = str(payload.get('text') or '')
             if not text:
                 continue
+            _note_assistant_event(event)
             if not assistant_parts and assistant_started_at is None:
                 assistant_started_at = created_at or time.time()
             assistant_parts.append(text)
@@ -3557,6 +4367,7 @@ def _append_journaled_partial_output(
             text = str(payload.get('text') or '').strip()
             if not text:
                 continue
+            _note_assistant_event(event)
             if not assistant_parts and assistant_started_at is None:
                 assistant_started_at = created_at or time.time()
             if assistant_parts and not ''.join(assistant_parts).endswith(('\n', ' ')):
@@ -3565,16 +4376,48 @@ def _append_journaled_partial_output(
             flush_assistant()
             continue
         if event_name == 'tool':
-            anchor_idx = flush_assistant()
-            if anchor_idx is None:
-                anchor_idx = ensure_assistant_anchor(created_at)
             name = str(payload.get('name') or 'tool')
             preview = str(payload.get('preview') or '')
-            if dedupe_existing and _journal_tool_already_present(
-                session, name, preview, stream_id=stream_id,
-            ):
-                current_assistant_idx = anchor_idx
+            event_identity = _journal_recovery_identity(
+                stream_id,
+                kind='tool',
+                first_seq=event.get('seq'),
+                first_at=created_at,
+            )
+            # Duplicate detection MUST run before any anchor is created: the
+            # old ordering minted a throwaway empty anchor at 3568 and only then
+            # discovered the tool card already existed.
+            existing_tool = _find_recovered_tool_card_by_identity(
+                session, event_identity,
+            )
+            # Legacy tool-card reconciliation is flag-independent for the same
+            # reason as the reasoning path: an upgrade replay must not append a
+            # duplicate card just because the caller passed dedupe_existing=False.
+            if existing_tool is None:
+                existing_tool = _find_journal_tool_card(
+                    session,
+                    name,
+                    preview,
+                    stream_id=stream_id,
+                    identity=event_identity,
+                )
+            anchor_idx = flush_assistant()
+            if existing_tool is not None:
+                owner_idx = existing_tool.get('assistant_msg_idx')
+                if isinstance(owner_idx, int) and 0 <= owner_idx < len(session.messages):
+                    current_assistant_idx = owner_idx
+                else:
+                    current_assistant_idx = anchor_idx
                 continue
+            if anchor_idx is None:
+                if tool_segment_first_seq is None:
+                    tool_segment_first_seq = event.get('seq')
+                    tool_segment_first_at = created_at
+                anchor_idx = ensure_assistant_anchor(
+                    created_at,
+                    identity_seq=tool_segment_first_seq,
+                    identity_at=tool_segment_first_at,
+                )
             recovered_tool_calls.append({
                 'name': name,
                 'preview': preview,
@@ -3585,6 +4428,7 @@ def _append_journaled_partial_output(
                 'done': False,
                 '_recovered_from_run_journal': True,
                 '_recovered_stream_id': stream_id,
+                '_recovery_identity': event_identity,
             })
             appended_any = True
             current_assistant_idx = anchor_idx
@@ -3657,6 +4501,7 @@ def _journal_retry_lock_for_sid(sid: str) -> threading.Lock:
 
 def _build_recovery_marker_with_retry_hook(
     *, recovered_output: bool, stream_id: str | None, pending_started_at=None,
+    interrupted_at=None,
 ) -> dict:
     """Build an interrupted-turn marker, arming the lazy-retry hook when
     visible output was not recovered yet but a stream id is available."""
@@ -3665,16 +4510,19 @@ def _build_recovery_marker_with_retry_hook(
             recovered_output=True,
             stream_id=stream_id,
             pending_started_at=pending_started_at,
+            interrupted_at=interrupted_at,
         )
     if not stream_id:
         return _interrupted_recovery_marker(
             recovered_output=False,
             pending_started_at=pending_started_at,
+            interrupted_at=interrupted_at,
         )
     marker = _interrupted_recovery_marker(
         pending_retry=True,
         stream_id=stream_id,
         pending_started_at=pending_started_at,
+        interrupted_at=interrupted_at,
     )
     marker['_journal_retry_stream_id'] = str(stream_id)
     marker['_journal_retry_attempts'] = 0
@@ -3707,48 +4555,136 @@ def _strip_journal_retry_meta(marker: dict) -> None:
     marker.pop('_journal_retry_first_seen_ts', None)
 
 
+def _is_journaled_recovered_row(msg) -> bool:
+    return isinstance(msg, dict) and bool(msg.get('_recovered_from_run_journal'))
+
+
 def _reorder_journal_tail_above_marker(session, marker_idx: int) -> None:
     """Move `_recovered_from_run_journal=True` rows appended *after*
     ``marker_idx`` to sit immediately above the marker so chronological
     order is preserved (journaled output happened during the turn, marker
     annotates its end).
+
+    Recovered and non-recovered tail rows can interleave (e.g. a retry marker
+    tail `[J1, N, J2]`). The previous arithmetic rebase assumed one contiguous
+    journaled span, so `J2` moved without its tool-card index being remapped.
+    Build an explicit old-index -> new-index map so every owner reference is
+    rebased by position, not by a single constant shift.
     """
     messages = session.messages
     if marker_idx < 0 or marker_idx >= len(messages):
         return
-    tail = messages[marker_idx + 1 :]
-    if not tail:
+    tail_indices = list(range(marker_idx + 1, len(messages)))
+    if not tail_indices:
         return
-    journaled = [
-        m for m in tail
-        if isinstance(m, dict) and m.get('_recovered_from_run_journal')
-    ]
-    if not journaled:
+    journaled_indices = [i for i in tail_indices if _is_journaled_recovered_row(messages[i])]
+    if not journaled_indices:
         return
-    rest = [
-        m for m in tail
-        if not (isinstance(m, dict) and m.get('_recovered_from_run_journal'))
-    ]
-    marker = messages[marker_idx]
-    new_messages = (
-        messages[:marker_idx]
-        + journaled
-        + [marker]
-        + rest
+    # Build the membership set ONCE. Rebuilding ``set(journaled_indices)`` inside
+    # the comprehension made the partition O(tail x journaled) under the
+    # recovery session lock (F7); hoisting restores a linear partition.
+    journaled_index_set = set(journaled_indices)
+    rest_indices = [i for i in tail_indices if i not in journaled_index_set]
+    order = (
+        list(range(marker_idx))
+        + journaled_indices
+        + [marker_idx]
+        + rest_indices
     )
-    # Rebase any tool_calls.assistant_msg_idx values that pointed into the
-    # journaled rows when they were appended at the tail.
-    old_journaled_idx_base = marker_idx + 1
-    new_journaled_idx_base = marker_idx
-    shift = new_journaled_idx_base - old_journaled_idx_base  # = -1
+    new_index_of = {old_idx: new_idx for new_idx, old_idx in enumerate(order)}
+    session.messages = [messages[i] for i in order]
+    # Rebase EVERY assistant_msg_idx through the true old->new map. Prefix rows
+    # map to themselves; the marker and tail rows move.
     for tool_call in session.tool_calls or []:
         if not isinstance(tool_call, dict):
             continue
         idx = tool_call.get('assistant_msg_idx')
-        if isinstance(idx, int) and idx >= old_journaled_idx_base \
-                and idx < old_journaled_idx_base + len(journaled):
-            tool_call['assistant_msg_idx'] = idx + shift
-    session.messages = new_messages
+        if isinstance(idx, int) and idx in new_index_of:
+            tool_call['assistant_msg_idx'] = new_index_of[idx]
+
+
+def _legacy_recovery_diagnostic_key(msg):
+    """Diagnostic key for a recovered row with no durable identity, or ``None``.
+
+    Two rows sharing this key are legacy duplicates (same stream + same
+    recovered text) whose provenance cannot be proven without journal
+    boundaries. This is diagnostic only: it never authorises a drop or merge.
+    """
+    if not isinstance(msg, dict) or not msg.get('_recovered_from_run_journal'):
+        return None
+    if msg.get('role') != 'assistant' or msg.get('_error'):
+        return None
+    if msg.get(_RECOVERY_IDENTITY_FIELD):
+        return None
+    return (
+        str(msg.get('_recovered_stream_id') or ''),
+        _normalize_journal_recovery_text(msg.get('content')),
+        _normalize_journal_recovery_text(
+            msg.get('reasoning') or msg.get('reasoning_content')
+        ),
+    )
+
+
+def _audit_recovery_invariants(session, *, context: str) -> None:
+    """Diagnostic-only audit of recovered-row / tool-owner invariants.
+
+    Never mutates or drops rows. Duplicate durable recovery identities,
+    duplicate *legacy* recovered rows (no durable identity), and recovered tool
+    cards whose ``assistant_msg_idx`` no longer resolves are reported so a
+    repair pass can resolve legacy ambiguity explicitly instead of silently
+    discarding reasoning.
+    """
+    messages = session.messages or []
+    identity_first_index: dict[str, int] = {}
+    legacy_first_index: dict[tuple, int] = {}
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        identity = msg.get(_RECOVERY_IDENTITY_FIELD)
+        if not identity:
+            legacy_key = _legacy_recovery_diagnostic_key(msg)
+            if legacy_key is not None:
+                if legacy_key in legacy_first_index:
+                    logger.warning(
+                        "%s: duplicate legacy recovered row (no durable "
+                        "identity) stream=%r at indexes %d and %d; keeping both "
+                        "rows and flagging legacy identity ambiguity for a "
+                        "repair pass",
+                        context,
+                        legacy_key[0],
+                        legacy_first_index[legacy_key],
+                        idx,
+                    )
+                else:
+                    legacy_first_index[legacy_key] = idx
+            continue
+        if identity in identity_first_index:
+            logger.warning(
+                "%s: duplicate recovery identity %s at indexes %d and %d; "
+                "keeping both rows and flagging legacy identity ambiguity "
+                "for a repair pass",
+                context,
+                identity,
+                identity_first_index[identity],
+                idx,
+            )
+        else:
+            identity_first_index[identity] = idx
+    for tool_call in session.tool_calls or []:
+        if not isinstance(tool_call, dict):
+            continue
+        if not tool_call.get('_recovered_from_run_journal'):
+            continue
+        owner = tool_call.get('assistant_msg_idx')
+        if not isinstance(owner, int) or not (0 <= owner < len(messages)):
+            logger.warning(
+                "%s: recovered tool card %r has unresolved owner "
+                "assistant_msg_idx=%r (messages=%d)",
+                context,
+                tool_call.get('name'),
+                owner,
+                len(messages),
+            )
 
 
 def _try_retry_journal_recovery_in_place(session) -> bool:
@@ -3806,7 +4742,7 @@ def _retry_journal_recovery_in_place(
             )
             if not stream_id:
                 # No stream id to retry against; demote immediately.
-                msg['content'] = _INTERRUPTED_NEUTRAL_WORDING
+                _refresh_interruption_age(msg, _INTERRUPTED_NEUTRAL_WORDING, None)
                 _strip_journal_retry_meta(msg)
                 try:
                     session.save(touch_updated_at=False)
@@ -3818,7 +4754,13 @@ def _retry_journal_recovery_in_place(
                     )
                 return False
             if give_up:
-                msg['content'] = _INTERRUPTED_NEUTRAL_WORDING
+                # Keep the age suffix; a cut proven by the journal in the
+                # meantime is now the best available value.
+                _refresh_interruption_age(
+                    msg,
+                    _INTERRUPTED_NEUTRAL_WORDING,
+                    _journal_interruption_cut_time(session, stream_id),
+                )
                 _strip_journal_retry_meta(msg)
                 try:
                     session.save(touch_updated_at=False)
@@ -3838,13 +4780,23 @@ def _retry_journal_recovery_in_place(
             )
             if recovered_output or terminal_error_recovered:
                 if not terminal_error_recovered:
-                    msg['content'] = _INTERRUPTED_RECOVERED_WORDING
+                    # Rebuild the wording with the now-proven cut instead of
+                    # discarding the age suffix; preserve the original
+                    # detection time from the marker.
+                    _refresh_interruption_age(
+                        msg,
+                        _INTERRUPTED_RECOVERED_WORDING,
+                        _journal_interruption_cut_time(session, stream_id),
+                    )
                     _strip_journal_retry_meta(msg)
                 # The journaled rows were appended at the end of messages;
                 # move them above the marker before either retaining its
                 # interrupted wording or replacing it with a specific terminal
                 # error from that same stream.
                 _reorder_journal_tail_above_marker(session, idx)
+                _audit_recovery_invariants(
+                    session, context="journal-retry merge boundary",
+                )
                 if terminal_error_recovered:
                     session.messages = [
                         message
@@ -3942,6 +4894,9 @@ def _apply_core_sync_or_error_marker(
     _terminal_recovery = _recoverable_unsaved_gateway_terminal_error(
         session, _stream_id,
     )
+    # A durable cut time can only come from a real terminal/cancel/shutdown
+    # journal event. pending_started_at is a start time, never a proven cut.
+    _interrupted_at = _journal_interruption_cut_time(session, _stream_id)
 
     # When messages is already non-empty, do not overwrite history from any core
     # transcript. The pending user turn may still be the only durable copy of a
@@ -3964,12 +4919,34 @@ def _apply_core_sync_or_error_marker(
         )
         _pending_started_at = session.pending_started_at
         if _run_journal_terminal_state(session, _stream_id) == 'completed':
-            if not (_already_checkpointed or _latest_user_matches_pending_text(session.messages, session.pending_user_message)):
+            _checkpoint_materialized = _pending_checkpoint_already_materialized(
+                session.messages,
+                session.pending_user_message,
+                _recovered_ts,
+                session.pending_user_source,
+                session.pending_attachments,
+            )
+            # A prompt already present as a bare user row only suppresses the
+            # new boundary when the journal has no recoverable output for it
+            # (a genuinely stale pending flag). When the journal DOES carry
+            # visible output, the matching text is a historical turn that
+            # repeats the prompt and the new boundary must be materialized.
+            _bare_text_materialized = (
+                not _checkpoint_materialized
+                and _latest_user_matches_pending_text(
+                    session.messages, session.pending_user_message,
+                )
+                and not _run_journal_has_visible_output(session, _stream_id)
+            )
+            if not (_checkpoint_materialized or _bare_text_materialized):
                 _append_recovered_pending_turn(session, timestamp=_recovered_ts)
             _append_journaled_partial_output(
                 session,
                 _stream_id,
                 dedupe_existing=True,
+            )
+            _audit_recovery_invariants(
+                session, context="completed stream recovery boundary",
             )
             session.active_stream_id = None
             session.pending_user_message = None
@@ -4002,6 +4979,7 @@ def _apply_core_sync_or_error_marker(
             _recover_journaled_output_and_terminal_error(
                 session,
                 _stream_id,
+                dedupe_existing=True,
                 terminal_recovery=_terminal_recovery,
             )
         )
@@ -4016,6 +4994,7 @@ def _apply_core_sync_or_error_marker(
                     recovered_output=recovered_output,
                     stream_id=_stream_id,
                     pending_started_at=_pending_started_at,
+                    interrupted_at=_interrupted_at,
                 )
             )
         session.save(touch_updated_at=touch_updated_at)
@@ -4081,6 +5060,7 @@ def _apply_core_sync_or_error_marker(
                         recovered_output=True,
                         stream_id=_stream_id,
                         pending_started_at=_pending_started_at,
+                        interrupted_at=_interrupted_at,
                     )
                 )
             # NOTE: when the core transcript was synced in but the run journal
@@ -4116,6 +5096,7 @@ def _apply_core_sync_or_error_marker(
         _recover_journaled_output_and_terminal_error(
             session,
             _stream_id,
+            dedupe_existing=True,
             terminal_recovery=_terminal_recovery,
         )
     )
@@ -4131,6 +5112,7 @@ def _apply_core_sync_or_error_marker(
                 recovered_output=recovered_output,
                 stream_id=_stream_id,
                 pending_started_at=_pending_started_at,
+                interrupted_at=_interrupted_at,
             )
         )
     session.save(touch_updated_at=touch_updated_at)

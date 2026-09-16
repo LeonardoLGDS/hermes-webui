@@ -69,7 +69,8 @@ from api.turn_journal import append_turn_journal_event_for_stream
 from api.usage import prompt_cache_hit_percent
 from api.models import (
     StateDBSessionMessagesSnapshot,
-    _is_empty_partial_activity_message,
+    _RECOVERY_IDENTITY_FIELD,
+    _is_authoritative_recovery_identity,
     _evict_sessions_over_cap,
     clear_process_wakeup_pause,
     get_state_db_session_messages,
@@ -2950,10 +2951,73 @@ def _completion_event_targets_webui_session(evt_session_key: str, session_id: st
         return False
 
 
+def _webui_external_completion_bindings(session_id, profile_home):
+    """Bind only the authenticated session and its resolved profile home."""
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if not isinstance(profile_home, str) or not profile_home.startswith('/'):
+        return None
+    try:
+        from tools import async_delegation as native
+        required = (
+            'rehydrate_external_completion_for_owner',
+            'validate_external_completion_event',
+            'record_external_continuation_receipt_if_persisted',
+            'renew_external_completion_delivery_claim',
+        )
+        if not all(callable(getattr(native, name, None)) for name in required):
+            return None
+        policy_hash = native.EXTERNAL_COMPLETION_POLICY_HASH
+    except (ImportError, AttributeError):
+        return None
+    route = {'platform': 'webui', 'chat_id': session_id, 'session_key': session_id}
+    try:
+        from tools.external_completion_release import authorize_owner
+        release_hash = authorize_owner(
+            session_id=session_id, profile_home=profile_home, route=route,
+            surface='webui', source_name='api.streaming', source_path=__file__,
+        )
+    except (ImportError, AttributeError, OSError):
+        return None
+    if release_hash is None:
+        return None
+    return {'owner_session_id': session_id, 'owner_profile': profile_home,
+            'route': route, 'policy_hash': policy_hash, 'release_hash': release_hash}
+
+
+def _bind_webui_round_owner(session_id, profile_home, execution_id=None):
+    """Optional trusted producer binding; no gateway profile/env mutation."""
+    bindings = _webui_external_completion_bindings(session_id, profile_home)
+    if bindings is None:
+        return None, None
+    try:
+        import sys
+        from tools import native_round_launch, external_round_bridge
+    except ImportError:
+        return None, None
+    token = native_round_launch.bind_round_owner(
+        session_id=session_id,
+        profile_home=profile_home,
+        route=bindings['route'],
+        python_path=sys.executable,
+        bridge_path=external_round_bridge.__file__,
+        release_hash=bindings['release_hash'],
+        scheduler_execution_id=execution_id,
+    )
+    return native_round_launch, token
+
+
+def _reset_webui_round_owner(module, token):
+    if module is not None:
+        module.unbind_round_owner(token)
+
+
 def _drain_webui_process_notifications(
     session_id: str,
     *,
     pending_async_acceptances: list | None = None,
+    external_bindings: dict | None = None,
+    pending_external_turns: list | None = None,
 ) -> list[str]:
     """Return completion notifications that belong to this WebUI session.
 
@@ -2975,18 +3039,139 @@ def _drain_webui_process_notifications(
     if completion_queue is None:
         return []
 
+    # External completion bindings are authoritative and supplied by the
+    # caller (authenticated session_id + already-resolved profile home). They
+    # are never derived from the event, environment, or live process registry.
+    _external_armed = (
+        isinstance(external_bindings, dict)
+        and external_bindings.get('owner_session_id') == session_id
+        and bool(external_bindings.get('owner_profile'))
+        and isinstance(pending_external_turns, list)
+    )
+    if _external_armed:
+        # External events are rehydrated into a PRIVATE queue owned by this
+        # drain, never the shared completion queue: background's drain tick
+        # must not consume the very event this turn is about to run, and a
+        # failed acquire here must not be re-read by this same drain.
+        _external_private_queue = queue.Queue()
+        try:
+            import tools.async_delegation as _native_delegation
+            rehydrate = getattr(
+                _native_delegation,
+                'rehydrate_external_completion_for_owner',
+                None,
+            )
+            if callable(rehydrate):
+                rehydrate(
+                    _external_private_queue,
+                    owner_session_id=external_bindings['owner_session_id'],
+                    owner_profile=external_bindings['owner_profile'],
+                    limit=1,
+                )
+        except Exception:
+            logger.debug(
+                "External completion rehydrate failed for session %s",
+                session_id,
+                exc_info=True,
+            )
+
+    _external_acquired = False
+    _mailbox_checked = False
+    _mailbox_reads = 0
+    _external_acquire_failures = []
+
     # Computed once per drain (not per event): reads/validates the env cap a
     # single time so an invalid value logs at most one warning per drain.
     stale_completion_max_age = _stale_completion_max_age_seconds()
 
     while True:
-        try:
-            evt = completion_queue.get_nowait()
-        except queue.Empty:
-            break
-        except Exception:
-            logger.debug("Failed to drain process completion queue", exc_info=True)
-            break
+        evt = None
+        evt_from_global = True
+        # Accept at most one mailbox event, skipping stale/claimed hints.
+        # Bound reads even if another producer keeps filling this FIFO.
+        if (_external_armed and not _mailbox_checked
+                and not _external_acquired and _mailbox_reads < 32):
+            _mailbox_reads += 1
+            try:
+                from api.external_completion_mailbox import get_shared_mailbox
+                evt = get_shared_mailbox().take(bindings=external_bindings)
+                if evt is not None:
+                    evt_from_global = False
+                else:
+                    _mailbox_checked = True
+            except Exception:
+                evt = None
+                _mailbox_checked = True
+        if evt is None:
+            _source_queues = [completion_queue]
+            if _external_armed:
+                _source_queues.insert(0, _external_private_queue)
+            for _source in _source_queues:
+                try:
+                    evt = _source.get_nowait()
+                    evt_from_global = _source is completion_queue
+                    break
+                except queue.Empty:
+                    continue
+                except Exception:
+                    logger.debug(
+                        "Failed to drain process completion queue", exc_info=True
+                    )
+                    evt = None
+                    break
+            if evt is None:
+                break
+
+        # External completion lifecycle is routed BEFORE any legacy claim or
+        # stale handler. Invalid/missing bindings -> skip/requeue; never ACK.
+        if (
+            isinstance(evt, dict)
+            and 'external_completion_v1' in evt
+        ):
+            if not _external_armed or _external_acquired:
+                skipped_events.append(evt)
+                continue
+            try:
+                from api.external_completion_turn import ExternalCompletionTurn
+                _external_requeue_target = (
+                    completion_queue
+                    if evt_from_global
+                    else (_external_private_queue if _external_armed else skipped_events)
+                )
+                turn = ExternalCompletionTurn(
+                    evt,
+                    bindings=external_bindings,
+                    # Acquire against a queue this drain never re-reads so a
+                    # failed acquire cannot be immediately reconsumed. A
+                    # mailbox/private acquire failure is kept off all source
+                    # queues, leaving its durable row for the idle rail; a
+                    # legacy global-queue event keeps skipped_events behavior.
+                    completion_queue=(
+                        skipped_events if evt_from_global else _external_acquire_failures
+                    ),
+                )
+                if not turn.acquire():
+                    # Acquire failure already appended the event to
+                    # skipped_events via requeue(); do nothing further.
+                    continue
+                # Re-point the turn at its true source queue for any future
+                # release/requeue calls.
+                turn.completion_queue = _external_requeue_target
+                pending_external_turns.append(turn)
+                _external_acquired = True
+                _delegation_id = evt.get('delegation_id')
+                notifications.append(
+                    "External completion accepted"
+                    + (f" (delegation_id={_delegation_id})" if _delegation_id else "")
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to accept external completion for session %s",
+                    session_id,
+                    exc_info=True,
+                )
+                skipped_events.append(evt)
+            continue
 
         evt_sid = completion_delivery_id(evt) if isinstance(evt, dict) else ''
         if not evt_sid:
@@ -5957,25 +6142,22 @@ def _restore_reasoning_metadata(previous_messages, updated_messages):
 
 
 def _restore_display_reasoning_metadata(previous_messages, updated_messages):
-    """Restore display-only thinking rows for visible transcript persistence."""
-    updated_messages = _restore_reasoning_metadata(previous_messages, updated_messages)
-    if not previous_messages or not updated_messages:
-        return updated_messages
-    prev_safe = _api_safe_message_positions(previous_messages)
-    safe_indices = {idx for idx, _ in prev_safe}
-    inserted_reasoning_only = 0
-    for prev_idx, prev_msg in enumerate(previous_messages):
-        if _is_empty_partial_activity_message(prev_msg):
-            continue
-        if prev_idx in safe_indices or not _is_reasoning_only_assistant_message(prev_msg):
-            continue
-        safe_pos = sum(1 for idx, _ in prev_safe if idx < prev_idx) + inserted_reasoning_only
-        existing = updated_messages[safe_pos] if safe_pos < len(updated_messages) else None
-        if isinstance(existing, dict) and _is_reasoning_only_assistant_message(existing):
-            continue
-        updated_messages.insert(safe_pos, copy.deepcopy(prev_msg))
-        inserted_reasoning_only += 1
-    return updated_messages
+    """Carry display metadata forward WITHOUT re-inserting display-only rows.
+
+    Display-only recovered reasoning rows are owned by the display backbone
+    (``previous_messages``) and ``_merge_display_messages_after_agent_result``
+    already preserves them exactly once. This helper's only job is to restore
+    non-API metadata (reasoning, stable ids, timestamps) onto the *matched*
+    provider rows.
+
+    It must never insert copies of the display-only history into the
+    provider-result array. The previous implementation computed an insertion
+    offset from the full-display API-safe position list; after context
+    shortening that offset falls inside/after the current-turn result slice, so
+    an old recovered row was re-appended below the fresh answer and the
+    transcript grew 1->2->3->4->5 across four ordinary successful turns.
+    """
+    return _restore_reasoning_metadata(previous_messages, updated_messages)
 
 
 def _session_context_messages(session):
@@ -5984,6 +6166,131 @@ def _session_context_messages(session):
     if isinstance(context_messages, list) and context_messages:
         return context_messages
     return session.messages or []
+
+
+def _row_identity_context(row):
+    """Return ``stream=<id> identity=<value>`` context for merge diagnostics."""
+    if not isinstance(row, dict):
+        return 'stream=<none> identity=<none>'
+    identity = row.get(_RECOVERY_IDENTITY_FIELD)
+    stream = row.get('_recovered_stream_id')
+    return 'stream=%s identity=%s' % (
+        stream if stream else '<none>',
+        identity if identity else '<none>',
+    )
+
+
+def _recovered_row_identity(msg):
+    """Authoritative comparison key for a display-only recovered row, or ``None``.
+
+    Only a durable ``_recovery_identity`` (stream + kind + concrete journal
+    boundary) is authoritative: it is stable across repeated load/finalize
+    calls and distinguishes separate same-text segments. Legacy rows predate
+    that field and carry no boundary evidence at all. A text-shaped key — even
+    a whitespace-normalized but 200-char-truncated reasoning string — is NOT
+    identity: two distinct payloads sharing a prefix would collide and one
+    would be silently dropped (F1). Legacy rows therefore return ``None`` and
+    the caller preserves them and reports the ambiguity instead of dropping.
+
+    A persisted identity that is itself boundary-free (for example
+    ``stream:reasoning:unknown``, written by older builds) is non-authoritative
+    for the same reason: it cannot prove which segment the row belongs to, so
+    it must not authorize a drop (R123-B).
+    """
+    if not isinstance(msg, dict) or not msg.get('_recovered_from_run_journal'):
+        return None
+    identity = msg.get(_RECOVERY_IDENTITY_FIELD)
+    if identity and _is_authoritative_recovery_identity(identity):
+        return f"recovery:{identity}"
+    return None
+
+
+def _legacy_recovered_reasoning_stream(msg):
+    """Diagnostic shape for a recovered reasoning row with no durable identity.
+
+    Returns the row's recovered stream id when it looks like a boundary-free
+    legacy recovered reasoning row, else ``None``. Used only to *diagnose*
+    legacy ambiguity; it never authorises a drop.
+    """
+    if not isinstance(msg, dict) or not msg.get('_recovered_from_run_journal'):
+        return None
+    identity = msg.get(_RECOVERY_IDENTITY_FIELD)
+    if identity and _is_authoritative_recovery_identity(identity):
+        return None
+    if msg.get('role') != 'assistant':
+        return None
+    if str(msg.get('content') or '').strip():
+        return None
+    if not str(msg.get('reasoning') or msg.get('reasoning_content') or '').strip():
+        return None
+    return str(msg.get('_recovered_stream_id') or '')
+
+
+def _drop_replayed_display_only_reasoning(candidates, previous_display):
+    """Drop display-only recovered rows already present in the display backbone.
+
+    The provider-result array must never (re-)append a historical display-only
+    reasoning row. Suppression is keyed on the DURABLE recovery identity only,
+    so genuinely NEW recovered activity (a new journal boundary / stream) still
+    flows through. Legacy rows have no durable boundary, so they are never
+    dropped on text shape; a matching one is preserved and reported as
+    ambiguous legacy identity for the repair pass.
+    """
+    if not candidates:
+        return candidates
+    existing = {_recovered_row_identity(m) for m in previous_display or []}
+    existing.discard(None)
+    legacy_streams = set()
+    for prev in previous_display or []:
+        stream = _legacy_recovered_reasoning_stream(prev)
+        if stream is not None:
+            legacy_streams.add(stream)
+    # Ambiguity must also be diagnosed WITHIN the candidate batch, not only
+    # against the display backbone: two boundary-free rows arriving together
+    # in one merge step are just as ambiguous as a replayed copy (R123-B).
+    batch_legacy_counts = {}
+    for msg in candidates:
+        stream = _legacy_recovered_reasoning_stream(msg)
+        if stream is not None:
+            batch_legacy_counts[stream] = batch_legacy_counts.get(stream, 0) + 1
+    reported_batch_streams = set()
+    kept = []
+    for msg in candidates:
+        identity = _recovered_row_identity(msg)
+        if identity is not None and identity in existing:
+            logger.debug(
+                "Dropped replayed display-only recovered row %s from display merge",
+                identity,
+            )
+            continue
+        if identity is None:
+            stream = _legacy_recovered_reasoning_stream(msg)
+            if stream is not None and stream in legacy_streams:
+                logger.warning(
+                    "Ambiguous legacy recovered reasoning row (stream %s) has no "
+                    "durable journal boundary; keeping every candidate row and "
+                    "flagging legacy identity ambiguity for a repair pass",
+                    stream,
+                )
+            elif (
+                stream is not None
+                and batch_legacy_counts.get(stream, 0) > 1
+                and stream not in reported_batch_streams
+            ):
+                reported_batch_streams.add(stream)
+                logger.warning(
+                    "Ambiguous legacy recovered reasoning batch (stream %s) at "
+                    "candidate index %d (%s): %d boundary-free rows in one merge "
+                    "step have no durable journal boundary; keeping every "
+                    "distinct row and flagging legacy identity ambiguity for a "
+                    "repair pass",
+                    stream,
+                    candidates.index(msg),
+                    _row_identity_context(msg),
+                    batch_legacy_counts[stream],
+                )
+        kept.append(msg)
+    return kept
 
 
 def _message_identity(msg):
@@ -6007,6 +6314,21 @@ def _message_identity(msg):
         # Now, _partial messages with empty text get a stable identity
         # keyed on their role + _partial flag + reasoning/tool metadata,
         # so the merge can dedup identical empty partials.
+        if msg.get('_recovered_from_run_journal'):
+            # Display-only recovered rows have no provider-visible text but
+            # must still be trackable (the r119 defect: they had no identity,
+            # so replayed copies could not be deduped). Prefer the durable
+            # recovery identity, which is stable across load/finalize.
+            recovered_key = _recovered_row_identity(msg)
+            if recovered_key:
+                return (role, '', '', recovered_key)
+            # Boundary-free recovered row: no text/prefix key may authorize a
+            # drop. Return None so the merge keeps every distinct payload and
+            # the candidate-batch diagnostic reports the ambiguity (R123-B).
+            # The prefix/overlap helpers below must treat this ``None`` as
+            # non-authoritative evidence, never as a key two rows can share
+            # (R126-B): ``None == None`` is not identity.
+            return None
         if msg.get('_partial'):
             reasoning_key = " ".join(str(msg.get('reasoning') or '').split())[:200]
             return (
@@ -6026,10 +6348,29 @@ def _message_identity(msg):
 
 def _messages_have_prefix(messages, prefix, *, key_fn=None):
     key_fn = key_fn or _message_identity
-    if len(messages or []) < len(prefix or []):
+    messages = list(messages or [])
+    prefix = list(prefix or [])
+    if len(messages) < len(prefix):
         return False
-    for idx, expected in enumerate(prefix or []):
-        if key_fn((messages or [])[idx]) != key_fn(expected):
+    for idx, expected in enumerate(prefix):
+        actual_key = key_fn(messages[idx])
+        expected_key = key_fn(expected)
+        if actual_key is None or expected_key is None:
+            # Absence of authoritative identity is not identity: two
+            # boundary-free recovered rows must never be treated as the same
+            # replayed row. Keep both and diagnose with stream/identity/index
+            # context (R126-B).
+            logger.warning(
+                "Ambiguous recovered row without a durable journal boundary at "
+                "prefix index %d (%s vs %s) has no authoritative identity; not "
+                "treating the prefix as replayed, preserving every distinct row "
+                "and flagging legacy identity ambiguity for a repair pass",
+                idx,
+                _row_identity_context(expected),
+                _row_identity_context(messages[idx]),
+            )
+            return False
+        if actual_key != expected_key:
             return False
     return True
 
@@ -6042,6 +6383,15 @@ def _message_replay_key(msg):
     # before the Agent sees the original wire bytes.  Keep synthetic/adjacent
     # partial collapse on the existing identity path; partial rows are display
     # bookkeeping rather than durable provider turns.
+    if (
+        isinstance(msg, dict)
+        and msg.get('_recovered_from_run_journal')
+        and not _recovered_row_identity(msg)
+    ):
+        # Boundary-free recovered row: the empty-content fallback below would
+        # be shared by every other boundary-free row and would prove an
+        # overlap that does not exist. No key means "never collapse" (R126-B).
+        return None
     raw_sidecar = (
         msg.get("api_content")
         if isinstance(msg, dict) and not msg.get("_partial")
@@ -6077,9 +6427,56 @@ def _strip_replayed_prefix(existing_messages, candidates):
     for overlap in range(max_overlap, 0, -1):
         left = [_message_replay_key(m) for m in existing_messages[-overlap:]]
         right = [_message_replay_key(m) for m in candidates[:overlap]]
-        if left == right:
-            return candidates[overlap:]
+        if any(key is None for key in left) or left != right:
+            # A boundary-free recovered row has no replay key: ``None == None``
+            # or an empty-content fallback must never prove that this prefix is
+            # already present (R126-B). Try a shorter overlap instead.
+            continue
+        return candidates[overlap:]
+    _diagnose_non_authoritative_overlap_block(existing_messages, candidates)
     return candidates
+
+
+def _diagnose_non_authoritative_overlap_block(existing_messages, candidates):
+    """Report the boundary-free row that stopped an overlap collapse.
+
+    A non-authoritative recovered row can never prove that a replayed prefix is
+    already present, so the overlap search stops at that position. Surface the
+    stream, identity and both involved indexes so the ambiguity is actionable
+    instead of silently collapsing or silently duplicating rows (R126-B).
+
+    Scan the WHOLE maximum alignment, not just its first mismatching offset: an
+    ordinary text mismatch at offset 0 can hide the boundary-free row that
+    actually blocked the overlap at a shorter offset (R132-B). If no
+    boundary-free row participates in this alignment, nothing is logged — an
+    ordinary prefix mismatch is not ambiguity.
+    """
+    max_overlap = min(len(existing_messages), len(candidates))
+    if not max_overlap:
+        return
+    left_rows = existing_messages[-max_overlap:]
+    right_rows = candidates[:max_overlap]
+    for offset in range(max_overlap):
+        left_row, right_row = left_rows[offset], right_rows[offset]
+        left_key = _message_replay_key(left_row)
+        right_key = _message_replay_key(right_row)
+        if left_key is not None and left_key == right_key:
+            continue
+        if left_key is None or right_key is None:
+            logger.warning(
+                "Ambiguous recovered row without a durable journal boundary; not "
+                "collapsing a replayed prefix overlap at existing index %d (%s) "
+                "vs candidate index %d (%s); preserving every distinct row and "
+                "flagging legacy identity ambiguity for a repair pass",
+                len(existing_messages) - max_overlap + offset,
+                _row_identity_context(left_row),
+                offset,
+                _row_identity_context(right_row),
+            )
+            return
+        # Ordinary mismatch: this offset does not prove the prefix is replayed
+        # either, but it is not the boundary-free blocker we diagnose. Keep
+        # scanning for one further down the same alignment.
 
 
 def _looks_like_replayed_session_arc_summary(previous_msg, candidate_msg):
@@ -7035,6 +7432,10 @@ def _merge_display_messages_after_agent_result(
             )
         candidates = turn_candidates
 
+    # Display-only recovered reasoning rows live in the display backbone only.
+    # Never re-append a copy that is already there (identity-keyed), even if a
+    # provider/legacy path leaked one into the result array.
+    candidates = _drop_replayed_display_only_reasoning(candidates, previous_display)
     merged = previous_display[:]
     seen = {_message_identity(m) for m in merged}
     current_user_key = _message_identity({'role': 'user', 'content': msg_text})
@@ -9742,12 +10143,14 @@ def _run_agent_streaming(
     # Placed ABOVE the _checkpoint_stop cluster so that cluster stays adjacent
     # to the `try:` (preserves the Issue #765 static-locator invariant).
     _turn_session_identity_tokens = None
+    _round_owner_binding_context = (None, None)
     _streaming_cron_profile_home_token = None
     _turn_pending_source = 'webui'
     _streaming_hermes_home_override_ctx = (None, None, False)
     _streaming_skill_home_snapshot = None
     _restore_streaming_skill_home_modules = False
     _acquired_streaming_skill_home_patch_lock = False
+    _external_completion_turns: list = []
     # Initialised here (before any code that may raise) so the outer `finally`
     # block can safely check `if _checkpoint_stop is not None` even when an
     # exception fires before the checkpoint thread is created (Issue #765).
@@ -11301,6 +11704,10 @@ def _run_agent_streaming(
             _process_notifications = _drain_webui_process_notifications(
                 session_id,
                 pending_async_acceptances=_pending_async_acceptances,
+                external_bindings=_webui_external_completion_bindings(
+                    session_id, _profile_home
+                ),
+                pending_external_turns=_external_completion_turns,
             )
             _agent_msg_text = msg_text
             if _process_notifications:
@@ -11360,7 +11767,30 @@ def _run_agent_streaming(
                     requested_provider=(_session_requested_provider or ""),
                 )
                 _run_conversation_kwargs["user_message"] = user_message
+            # External completion augmentation: applied to both the live agent
+            # message and the persisted user message, immediately before the
+            # real run_conversation call and after generic rejection/rebuild.
+            if _external_completion_turns:
+                _external_persist_user_message = msg_text
+                for _external_turn in _external_completion_turns:
+                    _agent_msg_text = _external_turn.augment_message(_agent_msg_text)
+                    _external_persist_user_message = _external_turn.augment_message(
+                        _external_persist_user_message
+                    )
+                user_message = _build_native_multimodal_message(
+                    workspace_ctx,
+                    _agent_msg_text,
+                    attachments,
+                    workspace,
+                    cfg=_cfg,
+                    active_provider=(resolved_provider or ""),
+                    active_model=(resolved_model or ""),
+                    requested_provider=(_session_requested_provider or ""),
+                )
+                _run_conversation_kwargs["user_message"] = user_message
+                _run_conversation_kwargs["persist_user_message"] = _external_persist_user_message
             _result_partial_pre_call_context = list(_previous_context_messages)
+            _round_owner_binding_context = _bind_webui_round_owner(session_id, _profile_home, stream_id)
             result = agent.run_conversation(**_run_conversation_kwargs)
             _active_turn_identity = _resolve_active_turn_authority(
                 _active_turn_identity,
@@ -13410,6 +13840,24 @@ def _run_agent_streaming(
             logger.debug("Failed to end metering session for stream %s", stream_id, exc_info=True)
         _metering_stop.set()
         # Stop the periodic checkpoint thread before the final recovery path.
+        # External completion turns: finalize lifecycle BEFORE any profile or
+        # context reset. Success requires the durable writeback to have
+        # committed and the turn not to have been cancelled.
+        for _external_turn in list(_external_completion_turns):
+            try:
+                _external_turn.finish(
+                    completed=bool(
+                        _success_writeback_committed
+                        and not cancel_event.is_set()
+                    ),
+                    cancelled=cancel_event.is_set(),
+                )
+            except Exception:
+                logger.debug(
+                    "External completion finish failed for stream %s",
+                    stream_id,
+                    exc_info=True,
+                )
         # The checkpoint thread also uses the per-session lock; joining it first
         # avoids contending with checkpoint writes during stale-pending repair.
         if _checkpoint_stop is not None:
@@ -13421,6 +13869,7 @@ def _run_agent_streaming(
                 and getattr(s, 'pending_user_message', None)):
             update_active_run(stream_id, phase="finalizing")
             _last_resort_sync_from_core(s, stream_id, _agent_lock)
+        _reset_webui_round_owner(*_round_owner_binding_context)
         _clear_thread_env()  # TD1: always clear thread-local context
         if _streaming_cron_profile_home_token is not None:
             _STREAMING_CRON_PROFILE_HOME.reset(_streaming_cron_profile_home_token)

@@ -1592,6 +1592,13 @@ function _wireMessageWindowLoadEarlierButton(){
   const indicator=$('loadOlderIndicator');
   if(!indicator) return;
   indicator.onclick=()=>{
+    // When the bounded window is a scan miss, the click must run the bounded
+    // find-earlier scan (fixed attempt budget, strictly advancing source
+    // cursor) instead of the legacy prepend path.
+    if(indicator.dataset&&indicator.dataset.scanExhausted==='1'&&typeof _findEarlierReadableHistory==='function'){
+      _findEarlierReadableHistory();
+      return;
+    }
     if(typeof _loadOlderMessages==='function') _loadOlderMessages();
   };
 }
@@ -16842,20 +16849,76 @@ function renderMessages(options){
   const assistantTurnVisibleContentByRawIdx=_assistantTurnVisibleContentMap(visWithIdx);
   const hasServerOlder=!!(typeof _messagesTruncated!=='undefined' && _messagesTruncated && S.messages.length>0);
   const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;
+  // #r120: the server's bounded-window metadata. `_oldestIdx` is an absolute
+  // SOURCE-record cursor, not a visible-message count, so it is never rendered
+  // as "N older messages". A scan-exhausted page (all rows rejected by the
+  // visibility predicate) must not look like an empty conversation: keep a
+  // readable status explanation regardless of thinking/worklog mode, and offer
+  // the bounded find-earlier scan.
+  const scanExhausted=!!(typeof _messagesScanExhausted!=='undefined'&&_messagesScanExhausted);
+  const scanIncomplete=!!(typeof _messagesIncomplete!=='undefined'&&_messagesIncomplete);
+  const windowReadableCount=Math.max(0,Number(typeof _messagesWindowReadableCount!=='undefined'?_messagesWindowReadableCount:0)||0);
+  const scanAttempts=Math.max(0,Number(typeof _messagesScanAttempts!=='undefined'?_messagesScanAttempts:0)||0);
+  const scanAttemptBudget=Math.max(1,Number(typeof _FIND_EARLIER_MAX_ATTEMPTS!=='undefined'?_FIND_EARLIER_MAX_ATTEMPTS:8)||8);
+  const scanStopped=scanExhausted&&scanIncomplete&&scanAttempts>=scanAttemptBudget;
+  // F5: an exhausted-but-complete scan (cursor reached 0) means there is no
+  // earlier readable history at all -- distinct from a bounded scan that
+  // stopped with more source rows left. Only the terminal case removes the
+  // continue affordance; reaching the attempt budget must NOT.
+  const scanTerminal=scanExhausted&&!scanIncomplete;
+  // G3: `windowReadableCount` describes the last returned page, which may be an
+  // OLDER all-junk page while the retained window still holds readable rows.
+  // Count what is actually on screen so a terminal notice never denies readable
+  // messages the user can see, and never claims the loaded rows are all
+  // non-renderable when they are not.
+  let retainedReadableCount=0;
+  if(typeof _messageIsRenderable==='function'){
+    for(const m of (S.messages||[])){ if(m&&m.role&&_messageIsRenderable(m)) retainedReadableCount+=1; }
+  }
+  // Only paint the recovery notice for a blank-looking window, or for the
+  // terminal earlier-history case where readable rows remain but nothing older
+  // is reachable. A readable window with a still-incomplete scan keeps the
+  // continue affordance and needs no "no readable messages" notice.
+  const scanNeedsRecovery=scanExhausted&&windowReadableCount<=0&&(retainedReadableCount<=0||scanTerminal);
   if(typeof _applySessionNavigationPrefs==='function') _applySessionNavigationPrefs();
   if(virtualWindow.virtualized&&virtualWindow.topPad>0){
     inner.appendChild(_messageVirtualSpacer(virtualWindow.topPad,'before'));
   }
-  if(hasServerOlder){
-    const indicator=document.createElement('button');
-    indicator.type='button';
-    indicator.id='loadOlderIndicator';
-    indicator.className='load-older-indicator message-window-load-earlier';
-    indicator.textContent=serverOlderCount>0
-      ? `Load earlier messages (${serverOlderCount} older)`
-      : (typeof t==='function'?t('load_older_messages'):'Load earlier messages');
-    inner.appendChild(indicator);
-    _wireMessageWindowLoadEarlierButton();
+  if(hasServerOlder||scanNeedsRecovery){
+    if(hasServerOlder&&!scanTerminal){
+      const indicator=document.createElement('button');
+      indicator.type='button';
+      indicator.id='loadOlderIndicator';
+      indicator.className='load-older-indicator message-window-load-earlier';
+      indicator.dataset.scanExhausted=scanExhausted?'1':'0';
+      indicator.dataset.sourceCursor=String(serverOlderCount);
+      // Honest label: `serverOlderCount` counts raw source records (including
+      // hidden tool/junk rows), so when no scan-exhaustion is involved it is
+      // presented as a source position, never as a visible-message count.
+      indicator.textContent=scanExhausted
+        ? 'Find earlier readable history'
+        : `Load earlier messages (from source record ${serverOlderCount})`;
+      inner.appendChild(indicator);
+      _wireMessageWindowLoadEarlierButton();
+    }
+    if(scanNeedsRecovery){
+      const notice=document.createElement('div');
+      notice.id='messageWindowScanNotice';
+      notice.className='message-window-scan-notice';
+      notice.setAttribute('role','status');
+      notice.dataset.scanExhausted='1';
+      // Plain-language recovery status, rendered independently of every
+      // thinking/worklog/transparent display mode: it explains a blank-looking
+      // page without exposing any reasoning content.
+      notice.textContent=scanStopped
+        ? `Stopped after ${scanAttempts} bounded scans — no readable messages found yet. This conversation is not empty; the rows loaded so far are non-renderable activity records. Use the button above to continue scanning for earlier readable history.`
+        : scanTerminal
+          ? (retainedReadableCount>0
+              ? 'No earlier readable history remains — the loaded window already contains readable messages and any rows before it are non-renderable activity records.'
+              : 'No readable messages in this conversation\'s records — the loaded rows are non-renderable activity records and no earlier readable history remains.')
+          : 'No readable messages in the records loaded so far. This is not an empty conversation — the loaded rows are non-renderable activity records. Use the button above to scan further back.';
+      inner.appendChild(notice);
+    }
   }
   let lastUserRawIdx=-1;
   for(let i=visWithIdx.length-1;i>=0;i--){
@@ -19465,7 +19528,9 @@ function autoResizeTextarea(ta) {
 async function submitEdit(msgIdx, newText) {
   if(!S.session || S.busy) return;
   const initialSid = S.session.session_id;
-  const absoluteKeepCount = _oldestIdx + msgIdx;
+  // Sparse retained runs carry per-range absolute starts; resolve this row's
+  // true absolute index instead of assuming one contiguous base (R1 / R128).
+  const absoluteKeepCount = (typeof _absoluteMessageIndex === 'function') ? _absoluteMessageIndex(msgIdx) : _oldestIdx + msgIdx;
   // #5924: capture the deliberate-pick signal up front (pre-network), scoped to
   // initialSid — a non-default session model (vs profile default), which is
   // inference-free and survives the failed send's marker consumption. See
@@ -19500,7 +19565,9 @@ async function regenerateResponse(btn) {
   if(!S.session || S.busy) return;
   const row=btn&&btn.closest&&btn.closest('[data-msg-idx]');
   if(!row)return;
-  const clickedAbsoluteIndex=_oldestIdx+parseInt(row.dataset.msgIdx,10);
+  const clickedAbsoluteIndex=(typeof _absoluteMessageIndex==='function')
+    ? _absoluteMessageIndex(parseInt(row.dataset.msgIdx,10))
+    : _oldestIdx+parseInt(row.dataset.msgIdx,10);
   const initialSid = S.session.session_id;
   if(typeof _ensureAllMessagesLoaded==='function'){
     await _ensureAllMessagesLoaded();
