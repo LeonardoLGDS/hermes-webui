@@ -6940,7 +6940,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     let body='';
     if(typeof m.content==='string') body=m.content;
     else if(Array.isArray(m.content)){
-      try:
+      try{
         const parts=m.content.map(p=>(p&&typeof p==='object')?(p.text||p.input_text||'')||'':String(p||''));
         // HW-008: build identity up to 160 chars without full join allocation
         if(parts.every(part=>typeof part==='string')){
