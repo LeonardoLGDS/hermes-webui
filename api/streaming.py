@@ -6346,6 +6346,26 @@ def _message_identity(msg):
     )
 
 
+def _is_boundary_free_recovered_row(msg):
+    """True only for the row class R126-B forbids matching on ``None``.
+
+    A display-only recovered row (``_recovered_from_run_journal``) that also
+    carries no authoritative ``_recovery_identity`` cannot prove which journal
+    segment it came from, so ``None == None`` must never prove a replay for it.
+    Every other identity-less row is an ordinary display row: a ``tool_use``-only
+    assistant row has no visible text and no ``tool_calls`` sidecar, so
+    ``_message_identity`` returns ``None`` for it even though it is perfectly
+    ordinary. Refusing on ``None`` for those rejected every replayed prefix that
+    contained one, duplicating the whole prior turn on each verification
+    writeback (exhibit: webui-13-adjudication-0915 rows 5/6/12/13).
+    """
+    return (
+        isinstance(msg, dict)
+        and bool(msg.get('_recovered_from_run_journal'))
+        and not _recovered_row_identity(msg)
+    )
+
+
 def _messages_have_prefix(messages, prefix, *, key_fn=None):
     key_fn = key_fn or _message_identity
     messages = list(messages or [])
@@ -6356,6 +6376,18 @@ def _messages_have_prefix(messages, prefix, *, key_fn=None):
         actual_key = key_fn(messages[idx])
         expected_key = key_fn(expected)
         if actual_key is None or expected_key is None:
+            if not (
+                _is_boundary_free_recovered_row(messages[idx])
+                or _is_boundary_free_recovered_row(expected)
+            ):
+                # Neither side is a boundary-free recovered row, so ``None``
+                # only means "ordinary row with no text/tool identity" here.
+                # Restore the pre-R126-B comparison for that case: two such
+                # rows still prove a replay, but ``None`` never matches a real
+                # key, so a genuine mismatch still refuses the prefix.
+                if actual_key != expected_key:
+                    return False
+                continue
             # Absence of authoritative identity is not identity: two
             # boundary-free recovered rows must never be treated as the same
             # replayed row. Keep both and diagnose with stream/identity/index
