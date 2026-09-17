@@ -73,8 +73,8 @@ def test_fork_uses_absolute_keep_count():
 def test_fork_captures_absolute_count_before_await():
     """The absolute keep_count must be captured BEFORE any ``await`` call."""
     body = _function_body(COMMANDS_JS, "forkFromMessage")
-    capture_match = re.search(r"absoluteKeepCount\s*=\s*_oldestIdx\s*\+\s*msgIdx", body)
-    assert capture_match, "Missing absoluteKeepCount = _oldestIdx + msgIdx assignment"
+    capture_match = re.search(r"absoluteKeepCount\s*=\s*(?:\(typeof _absoluteMessageIndex === 'function'\)\s*\?\s*_absoluteMessageIndex\(msgIdx\)\s*:\s*)?_oldestIdx\s*\+\s*msgIdx", body)  # P0 R1/R128: resolver ternary wraps the _oldestIdx + msgIdx base
+    assert capture_match, "Missing absoluteKeepCount = <absolute resolver> assignment"
     capture_idx = capture_match.start()
     # Find the first await in the function body.
     await_match = re.search(r"\bawait\b", body)
@@ -184,7 +184,7 @@ def test_fork_absolute_count_reduces_to_msgIdx_when_oldestIdx_zero():
     # The expression _oldestIdx + msgIdx evaluates to msgIdx when _oldestIdx==0.
     # Verify the expression exists (already checked above) and that there
     # is no conditional that would skip the computation for non-truncated sessions.
-    assert re.search(r"absoluteKeepCount\s*=\s*_oldestIdx\s*\+\s*msgIdx", body), (
+    assert re.search(r"absoluteKeepCount\s*=\s*(?:\(typeof _absoluteMessageIndex === 'function'\)\s*\?\s*_absoluteMessageIndex\(msgIdx\)\s*:\s*)?_oldestIdx\s*\+\s*msgIdx", body), (
         "The absolute count must always be computed as _oldestIdx + msgIdx. "
         "When _oldestIdx is 0 (full transcript loaded), this equals msgIdx, "
         "preserving short-session behaviour. See #2184."

@@ -125,18 +125,24 @@ def test_ensure_all_bumps_generation_before_replace():
     """Bump must happen BEFORE the wholesale `S.messages =` replace so racing prefetch sees it."""
     import re
     body = _function_body(SESSIONS_JS, "_ensureAllMessagesLoaded")
-    bump_idx = body.rindex("_bumpMessagesGeneration()")
     # Match the wholesale replace by its LHS, not the RHS variable name — #3306
     # added an ephemeral-field carry-forward so the RHS is now `_msgsToAssign`
     # rather than the literal `msgs`. The invariant we protect is bump-before-replace.
-    m = re.search(r"S\.messages\s*=\s*\w+;", body)
-    assert m is not None, "expected a wholesale `S.messages = <var>;` replace in _ensureAllMessagesLoaded"
-    replace_idx = m.start()
-    assert bump_idx < replace_idx, (
-        "_ensureAllMessagesLoaded must bump the generation token BEFORE the "
-        "wholesale replace, otherwise an in-flight prefetch's post-await "
-        "check could read the old value and prepend duplicates. See #1937."
-    )
+    # P0 read-side windowing refactor: this function now wholesale-replaces at
+    # two sites (installFullTranscript's `carried` and the honest-partial
+    # finalize's `_msgsToAssign`). Check the invariant per replace site instead
+    # of pairing the LAST bump with the FIRST replace across the whole body.
+    bumps = [b.start() for b in re.finditer(r"_bumpMessagesGeneration\(\)", body)]
+    replaces = [r0.start() for r0 in re.finditer(r"S\.messages\s*=\s*\w+;", body)]
+    assert replaces, "expected a wholesale `S.messages = <var>;` replace in _ensureAllMessagesLoaded"
+    prev_replace = -1
+    for r_idx in replaces:
+        assert any(prev_replace < b < r_idx for b in bumps), (
+            "_ensureAllMessagesLoaded must bump the generation token BEFORE the "
+            "wholesale replace, otherwise an in-flight prefetch's post-await "
+            "check could read the old value and prepend duplicates. See #1937."
+        )
+        prev_replace = r_idx
 
 
 def test_ensure_all_claims_loading_older_mutex():
@@ -210,13 +216,17 @@ def test_ensure_all_guards_against_session_switch_mid_await():
     import re
     body = _function_body(SESSIONS_JS, "_ensureAllMessagesLoaded")
     await_idx = body.index("await api(")
-    sid_check_idx = body.index("S.session.session_id !== sid", await_idx)
-    # #3306 renamed the replace RHS from `msgs` to `_msgsToAssign` (carry-forward);
-    # match by LHS so the ordering invariant survives the rename.
-    m = re.search(r"S\.messages\s*=\s*\w+;", body[await_idx:])
-    assert m is not None, "expected a wholesale `S.messages = <var>;` replace after the await"
-    replace_idx = await_idx + m.start()
-    assert await_idx < sid_check_idx < replace_idx, (
+    # P0 read-side windowing refactor: the post-await session-switch guard moved
+    # into the ownershipHolds() closure (`S.session.session_id === sid`) and the
+    # wholesale replace is now performed by installFullTranscript(...). Same
+    # invariant, new call shape: the guard must be evaluated after the await and
+    # before the transcript is installed.
+    assert "S.session.session_id === sid" in body, (
+        "the session-switch guard must still compare S.session.session_id to sid"
+    )
+    guard_idx = body.index("ownershipHolds()", await_idx)
+    install_idx = body.index("installFullTranscript(", await_idx)
+    assert await_idx < guard_idx < install_idx, (
         "_ensureAllMessagesLoaded must guard against session-switch races "
         "(re-check S.session.session_id after await) BEFORE wholesale-"
         "replacing S.messages. The pre-fix version had no such guard."

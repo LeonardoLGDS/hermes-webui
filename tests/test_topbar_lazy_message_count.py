@@ -16,7 +16,12 @@ def test_topbar_uses_session_total_for_lazy_loaded_transcripts():
 
 def test_load_earlier_indicator_names_server_side_older_count():
     assert "const serverOlderCount=hasServerOlder&&Number.isFinite(Number(_oldestIdx))?Math.max(0,Number(_oldestIdx)):0;" in UI_JS
-    assert "Load earlier messages (${serverOlderCount} older)" in UI_JS
+    # P0 re-pin (stale pin 14): the indicator no longer renders a bare
+    # "<n> older" count. It names the SERVER-side source position (raw
+    # records, hidden tool/junk rows included) and says so, and it falls
+    # back to an honest recovery affordance once the scan is exhausted.
+    assert "Load earlier messages (from source record ${serverOlderCount})" in UI_JS
+    assert "'Find earlier readable history'" in UI_JS
 
 
 def test_sync_topbar_does_not_count_only_loaded_tail_messages():

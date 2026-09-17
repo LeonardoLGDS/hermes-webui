@@ -20,7 +20,9 @@ def test_message_virtualization_switches_render_messages_to_scroll_driven_window
 def test_load_earlier_only_pages_server_history_and_preserves_scroll():
     assert "function _wireMessageWindowLoadEarlierButton()" in UI_JS
     assert "if(typeof _loadOlderMessages==='function') _loadOlderMessages();" in UI_JS
-    assert "if(hasServerOlder){" in UI_JS
+    # P0 scan-recovery widened this branch gate; server-older paging is still
+    # gated on hasServerOlder.
+    assert "if(hasServerOlder||scanNeedsRecovery){" in UI_JS
     assert "if(virtualWindow.virtualized&&virtualWindow.topPad>0)" in UI_JS
     assert "_messageRenderWindowSize=_currentMessageRenderWindowSize()+Math.max(addedRenderable, MESSAGE_RENDER_WINDOW_DEFAULT);" in SESSIONS_JS
     assert "renderMessages({ preserveScroll: true });" in SESSIONS_JS

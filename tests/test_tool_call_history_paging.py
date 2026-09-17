@@ -15,8 +15,24 @@ def test_sessions_js_resyncs_tool_calls_after_history_window_replacement():
     """
     assert "function _syncToolCallsForLoadedMessages(messages, sessionToolCalls)" in SESSIONS_JS
     assert "_syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);" in SESSIONS_JS
-    assert "S.messages = nextMessages;\n    _syncToolCallsForLoadedMessages(nextMessages, responseSession.tool_calls);" in SESSIONS_JS
-    assert "S.messages = _msgsToAssign;\n    _messagesTruncated = false;\n    _oldestIdx = 0;\n    _syncToolCallsForLoadedMessages(msgs, data.session.tool_calls);" in SESSIONS_JS
+    # P0 windowing refactor installs _setMessageSegments(nextSegments) between
+    # the wholesale replace and the resync; adjacency pin becomes ordering pin.
+    _replace_i = SESSIONS_JS.index("S.messages = nextMessages;")
+    _resync_i = SESSIONS_JS.index("_syncToolCallsForLoadedMessages(nextMessages, responseSession.tool_calls);")
+    assert _replace_i < _resync_i, (
+        "the history-window replace must be followed by the tool-call resync for the same window"
+    )
+    # P0 windowing refactor moved the full-transcript wholesale replace into
+    # _ensureAllMessagesLoaded installFullTranscript() helper (carry-forward
+    # result is `carried`; a _setMessageSegments(null) reset now sits between
+    # the replace and the truncation reset). Pin the invariant by ordering
+    # within that helper instead of the old byte-adjacent block.
+    _it = SESSIONS_JS[SESSIONS_JS.index("const installFullTranscript"):]
+    _replace_i2 = _it.index("S.messages = carried;")
+    for _needle in ("_messagesTruncated = false;", "_oldestIdx = 0;", "_syncToolCallsForLoadedMessages(carried,"):
+        assert _replace_i2 < _it.index(_needle), (
+            "installFullTranscript must clear truncation, rebase _oldestIdx and resync tool calls after the wholesale replace"
+        )
 
 
 def test_sessions_js_clears_session_tool_calls_when_messages_have_own_metadata():

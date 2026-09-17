@@ -24,7 +24,9 @@ def _function_body(src: str, name: str) -> str:
 
 def test_submit_edit_uses_absolute_keep_count():
     body = _function_body(UI_JS, "submitEdit")
-    assert re.search(r"absoluteKeepCount\s*=\s*_oldestIdx\s*\+\s*msgIdx", body)
+    # P0 R1/R128: absoluteKeepCount resolves per-range starts for sparse
+    # retained runs, falling back to the contiguous _oldestIdx + msgIdx base.
+    assert re.search(r"absoluteKeepCount\s*=\s*(?:\(typeof _absoluteMessageIndex === 'function'\)\s*\?\s*_absoluteMessageIndex\(msgIdx\)\s*:\s*)?_oldestIdx\s*\+\s*msgIdx", body)
     assert "keep_count: absoluteKeepCount" in body
 
 
@@ -37,7 +39,7 @@ def test_regenerate_delegates_to_atomic_start_without_client_truncation():
 
 def test_submit_edit_captures_absolute_before_await():
     body = _function_body(UI_JS, "submitEdit")
-    cap = re.search(r"absoluteKeepCount\s*=\s*_oldestIdx\s*\+\s*msgIdx", body)
+    cap = re.search(r"absoluteKeepCount\s*=\s*(?:\(typeof _absoluteMessageIndex === 'function'\)\s*\?\s*_absoluteMessageIndex\(msgIdx\)\s*:\s*)?_oldestIdx\s*\+\s*msgIdx", body)  # P0 R1/R128 resolver-ternary shape
     assert cap
     first_await = re.search(r"\bawait\b", body)
     assert first_await and cap.start() < first_await.start()

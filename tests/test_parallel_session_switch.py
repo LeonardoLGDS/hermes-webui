@@ -504,8 +504,11 @@ class TestMessagePaginationFrontend:
     def test_oldest_idx_reset_on_session_switch(self):
         """_oldestIdx must be reset to 0 on session switch."""
         # Find the loadSession reset block
-        idx = SESSIONS_JS.find("_messagesTruncated = false;\n    _oldestIdx = 0;")
-        assert idx >= 0, (
+        import re
+        # P0 windowing refactor restyled/indentated the reset blocks; pin the
+        # pair with a whitespace-insensitive regex, not an exact byte literal.
+        m = re.search(r"_messagesTruncated\s*=\s*false;\s*\n\s*_oldestIdx\s*=\s*0;", SESSIONS_JS)
+        assert m is not None, (
             "_oldestIdx must be reset to 0 alongside _messagesTruncated on session switch"
         )
 
