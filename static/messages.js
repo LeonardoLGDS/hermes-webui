@@ -6940,7 +6940,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     let body='';
     if(typeof m.content==='string') body=m.content;
     else if(Array.isArray(m.content)){
-      try{ body=m.content.map(p=>(p&&typeof p==='object')?(p.text||p.input_text||'')||'':String(p||'')).join('').slice(0,160); }catch(_){ body=''; }
+      try:
+        const parts=m.content.map(p=>(p&&typeof p==='object')?(p.text||p.input_text||'')||'':String(p||''));
+        // HW-008: build identity up to 160 chars without full join allocation
+        if(parts.every(part=>typeof part==='string')){
+          for(let i=0;i<parts.length&&body.length<160;i++) body+=(parts[i]||'').slice(0,160-body.length);
+        }else{
+          body=parts.join('').slice(0,160);
+        }
+      }catch(_){ body=''; }
     }
     return `${m.role}|${ts}|${body.slice(0,160)}`;
   }
